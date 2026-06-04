@@ -288,14 +288,15 @@ func (s *Store) DeleteItem(id string, hard bool) error {
 }
 
 type ListParams struct {
-	Type      string
-	Tag       string
-	Status    string
-	ListID    string
-	CreatedBy string
-	Limit     int
-	Offset    int
-	Sort      string
+	Type        string
+	Tag         string
+	ExcludeTags []string
+	Status      string
+	ListID      string
+	CreatedBy   string
+	Limit       int
+	Offset      int
+	Sort        string
 }
 
 func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
@@ -309,6 +310,13 @@ func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 	if p.Tag != "" {
 		where = append(where, "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)")
 		args = append(args, p.Tag)
+	}
+	for _, ex := range p.ExcludeTags {
+		if ex == "" {
+			continue
+		}
+		where = append(where, "NOT EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)")
+		args = append(args, ex)
 	}
 	if p.Status != "" {
 		where = append(where, "status = ?")

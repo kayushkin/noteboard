@@ -147,3 +147,54 @@ func TestTags(t *testing.T) {
 		t.Fatalf("expected 2 tags, got %d", len(tagInfos))
 	}
 }
+
+// TestExcludeTag covers the server-side exclude_tag list filter, which lets a
+// consumer drop machine-generated noise (e.g. autoworker dispatch cards) from
+// the open-todo query before the limit is applied.
+func TestExcludeTag(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+
+	mk := func(title string, tags []string) {
+		body, _ := json.Marshal(map[string]interface{}{"type": "todo", "title": title, "tags": tags})
+		req := httptest.NewRequest("POST", "/api/items", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 201 {
+			t.Fatalf("create %q: expected 201, got %d: %s", title, w.Code, w.Body.String())
+		}
+	}
+	mk("Real human todo", []string{"home"})
+	mk("autoworker dispatch", []string{"autoworker", "anthropic"})
+	mk("scheduler noise", []string{"autoworker", "scheduler"})
+
+	list := func(query string) []model.Item {
+		req := httptest.NewRequest("GET", "/api/items?type=todo&status=open"+query, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("list %q: expected 200, got %d", query, w.Code)
+		}
+		var items []model.Item
+		json.NewDecoder(w.Body).Decode(&items)
+		return items
+	}
+
+	if got := list(""); len(got) != 3 {
+		t.Fatalf("no filter: expected 3 todos, got %d", len(got))
+	}
+
+	got := list("&exclude_tag=autoworker")
+	if len(got) != 1 {
+		t.Fatalf("exclude autoworker: expected 1 todo, got %d", len(got))
+	}
+	if got[0].Title != "Real human todo" {
+		t.Fatalf("exclude autoworker: expected the human todo, got %q", got[0].Title)
+	}
+
+	// Multiple exclude_tag values are AND-combined (item must lack all of them).
+	if got := list("&exclude_tag=autoworker&exclude_tag=home"); len(got) != 0 {
+		t.Fatalf("exclude autoworker+home: expected 0 todos, got %d", len(got))
+	}
+}

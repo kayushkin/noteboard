@@ -65,14 +65,15 @@ func (a *API) items(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(q.Get("limit"))
 		offset, _ := strconv.Atoi(q.Get("offset"))
 		items, err := a.store.ListItems(db.ListParams{
-			Type:      q.Get("type"),
-			Tag:       q.Get("tag"),
-			Status:    q.Get("status"),
-			ListID:    q.Get("list_id"),
-			CreatedBy: q.Get("created_by"),
-			Limit:     limit,
-			Offset:    offset,
-			Sort:      q.Get("sort"),
+			Type:        q.Get("type"),
+			Tag:         q.Get("tag"),
+			ExcludeTags: q["exclude_tag"],
+			Status:      q.Get("status"),
+			ListID:      q.Get("list_id"),
+			CreatedBy:   q.Get("created_by"),
+			Limit:       limit,
+			Offset:      offset,
+			Sort:        q.Get("sort"),
 		})
 		if err != nil {
 			writeError(w, 500, err.Error())
