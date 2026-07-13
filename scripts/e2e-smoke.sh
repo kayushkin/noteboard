@@ -10,11 +10,15 @@
 # can BOOT. Two failure classes here are invisible to the compiler:
 #
 #   1. FTS5. internal/db.migrate() runs `CREATE VIRTUAL TABLE ... USING fts5`,
-#      which only exists if mattn/go-sqlite3 was compiled with the FTS5 module
-#      (the CGO_CFLAGS below, mirroring the Makefile). A plain `go build` yields
-#      a binary that compiles green and then dies on first boot with
-#      "Failed to open database: no such module: fts5". The /api/search
-#      assertion below is what actually exercises that module at runtime.
+#      which only resolves if the SQLite driver ships the FTS5 module. The
+#      /api/search assertion below is what actually exercises it at runtime.
+#      This used to be a live trap: under mattn/go-sqlite3, FTS5 arrived only
+#      via CGO_CFLAGS=-DSQLITE_ENABLE_FTS5, which only the Makefile passed, so a
+#      plain `go build` produced a binary that compiled green and then died at
+#      boot with "no such module: fts5". The driver is now modernc.org/sqlite
+#      (pure Go, FTS5 built in) and the build below sets CGO_ENABLED=0 — so if
+#      a cgo SQLite driver ever comes back, this smoke fails at the build step
+#      rather than shipping a binary that cannot open its own database.
 #   2. Route registration. internal/api.Handler() registers overlapping
 #      patterns ("/api/items/rerank" inside "/api/items/"). http.ServeMux
 #      panics on a conflicting pattern at REGISTRATION time — no compiler sees
@@ -40,12 +44,6 @@ for bin in go curl jq; do
     exit 2
   fi
 done
-# mattn/go-sqlite3 is CGO — no C compiler means no build at all.
-if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-  echo "ERROR: no C compiler (cc/gcc) on PATH — go-sqlite3 needs CGO" >&2
-  exit 2
-fi
-
 TMP_DIR="$(mktemp -d -t noteboard-e2e.XXXXXX)"
 BIN_DIR="$TMP_DIR/bin"
 DATA_DIR="$TMP_DIR/data"
@@ -103,10 +101,10 @@ fi
 
 step "build noteboard from $REPO_DIR"
 cd "$REPO_DIR"
-# Mirrors the Makefile: go-sqlite3 must be built with the FTS5 module compiled
-# in or internal/db.migrate() fails at boot. Keep in sync with ./Makefile.
-CGO_CFLAGS="-DSQLITE_ENABLE_FTS5" CGO_LDFLAGS="-lm" \
-  go build -o "$BIN_DIR/noteboard" ./cmd/noteboard/
+# Default flags, cgo off, mirroring ./Makefile — no special environment. That is
+# the point: the build a person or a build guard gets by typing `go build` has
+# to be the build that boots. See the FTS5 note in this file's header.
+CGO_ENABLED=0 go build -o "$BIN_DIR/noteboard" ./cmd/noteboard/
 echo "    binary: $BIN_DIR/noteboard ($(ls -lh "$BIN_DIR/noteboard" | awk '{print $5}'))"
 
 step "launch noteboard on :$PORT (db: $DB_PATH)"

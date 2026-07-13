@@ -11,8 +11,24 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kayushkin/noteboard/internal/model"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
+
+// dsnParams configures every connection modernc.org/sqlite opens.
+//
+// _pragma is the ONLY way this driver accepts pragmas — it silently ignores
+// unrecognised DSN keys, so the mattn-style "_journal_mode=WAL&_busy_timeout=5000"
+// this used to carry would be accepted and do nothing at all.
+//
+// _time_format=sqlite pins how a time.Time binds to a DATETIME column. The
+// driver's default is Go's time.Time.String() — "2026-07-13 01:47:00.78 +0000
+// UTC" — which is not a timestamp SQLite can read: date(), julianday() and
+// strftime() all return NULL on it, silently. "sqlite" selects SQLite's own
+// format, which is also byte-for-byte what mattn/go-sqlite3 wrote for this
+// table's entire history, so rows written before and after the driver swap are
+// indistinguishable. TestTimestampsAreStoredInSQLiteFormat and
+// TestStoredTimestampsAreReadableBySQLiteDateFunctions pin both halves.
+const dsnParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_time_format=sqlite"
 
 type Store struct {
 	db *sql.DB
@@ -24,10 +40,15 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", dbPath+"?"+dsnParams)
 	if err != nil {
 		return nil, err
 	}
+
+	// modernc.org/sqlite still surfaces SQLITE_BUSY to concurrent writers even
+	// with WAL and a busy_timeout set, so the pool is pinned to a single
+	// connection and writes serialise in database/sql instead.
+	db.SetMaxOpenConns(1)
 
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -100,7 +121,12 @@ func (s *Store) Close() error { return s.db.Close() }
 func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var item model.Item
 	var tagsJSON, linksJSON string
-	var dueAt, parentID sql.NullString
+	// due_at is declared DATETIME, so the driver decodes it to a time.Time for
+	// us — scanning it as a string would take a lossy detour back through
+	// RFC3339Nano. Scanning it as a time also means an unparseable value fails
+	// here instead of silently becoming the zero time.
+	var dueAt sql.NullTime
+	var parentID sql.NullString
 
 	err := row.Scan(
 		&item.ID, &item.Type, &item.Title, &item.Body,
@@ -121,7 +147,9 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 		item.Links = []string{}
 	}
 	if dueAt.Valid {
-		t, _ := time.Parse(time.RFC3339, dueAt.String)
+		// Kept in whatever zone it was stored with, not normalised to UTC: the
+		// offset is part of the value a caller gave us, and JSON renders it back.
+		t := dueAt.Time
 		item.DueAt = &t
 	}
 	if parentID.Valid {
