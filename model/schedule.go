@@ -70,6 +70,11 @@ type Schedule struct {
 	// crashes and reruns, or a */15 tick that fires twice, must not produce two
 	// child items for the same Tuesday.
 	LastMaterializedAt *time.Time `json:"last_materialized_at,omitempty"`
+
+	// LastNaggedAt is the last time this item's nag rule actually reached the
+	// user. Same purpose, other axis: the coordinator ticks every 15 minutes, so
+	// without it a single 10am firing would be re-sent on all 96 ticks of the day.
+	LastNaggedAt *time.Time `json:"last_nagged_at,omitempty"`
 }
 
 // What an occurrence means when it comes due.
