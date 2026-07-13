@@ -203,15 +203,42 @@ PATCHED="$(curl -fsS -X PATCH "$BASE/api/items/$ID" \
   || fail "status=done did not persist to the DB"
 echo "    status: done (persisted)"
 
-step "DELETE /api/items/$ID — soft-delete archives"
+step "DELETE /api/items/$ID — reversible delete, and it does not touch status"
 curl -fsS -X DELETE "$BASE/api/items/$ID" >/dev/null \
   || fail "DELETE /api/items/$ID did not answer 2xx"
-[ "$(curl -fsS "$BASE/api/items/$ID" | jq -r '.status')" = "archived" ] \
-  || fail "DELETE did not archive the item"
-# Archived items drop out of the health count, so we are back to an empty board.
+# A deleted item is gone from every read path. Asking for it by id 404s; only a
+# caller that explicitly wants the tombstone gets one.
+curl -fsS -o /dev/null "$BASE/api/items/$ID" 2>/dev/null \
+  && fail "GET returned a deleted item — a soft delete any read still returns is not a delete"
+[ "$(curl -fsS "$BASE/api/items/$ID?include_deleted=true" | jq -r '.deleted_at')" != "null" ] \
+  || fail "DELETE did not stamp deleted_at"
+# The status the item had is preserved, NOT overwritten with 'archived' — that
+# overload is the bug this replaced, and it made deletes indistinguishable from
+# a user archiving something on purpose.
+[ "$(curl -fsS "$BASE/api/items/$ID?include_deleted=true" | jq -r '.status')" = "done" ] \
+  || fail "DELETE clobbered status; it must leave the item's own state alone"
 COUNT1="$(curl -fsS "$BASE/health" | jq -r '.items')"
-[ "$COUNT1" = "0" ] || fail "expected 0 live items after archive, got $COUNT1"
-echo "    archived; live item count back to 0"
+[ "$COUNT1" = "0" ] || fail "expected 0 live items after delete, got $COUNT1"
+echo "    deleted (status preserved); live item count back to 0"
+
+step "POST /api/items/$ID/restore — the delete is undoable"
+curl -fsS -X POST "$BASE/api/items/$ID/restore" >/dev/null \
+  || fail "restore did not answer 2xx"
+[ "$(curl -fsS "$BASE/api/items/$ID" | jq -r '.status')" = "done" ] \
+  || fail "restored item did not come back in the state it was deleted in"
+echo "    restored intact"
+
+step "GET /api/items/$ID/revisions — every mutation left a trail"
+REVS="$(curl -fsS "$BASE/api/items/$ID/revisions" | jq -r 'length')"
+[ "$REVS" -ge 3 ] \
+  || fail "expected update+delete+restore to be recorded, got $REVS revisions"
+curl -fsS "$BASE/api/items/$ID/revisions" | jq -e 'map(.reason) | index("delete")' >/dev/null \
+  || fail "the delete was not recorded in the change log"
+echo "    $REVS revisions recorded; prior states recoverable"
+
+# Put the board back to empty so the hermetic check below sees what it expects.
+curl -fsS -X DELETE "$BASE/api/items/$ID" >/dev/null \
+  || fail "final DELETE did not answer 2xx"
 
 step "confirm the run was hermetic"
 [ -f "$DB_PATH" ] || fail "temp DB $DB_PATH was never created — where did the data go?"
