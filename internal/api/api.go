@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/kayushkin/noteboard/internal/db"
-	"github.com/kayushkin/noteboard/internal/model"
+	"github.com/kayushkin/noteboard/model"
 )
 
 type API struct {

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kayushkin/noteboard/internal/model"
+	"github.com/kayushkin/noteboard/model"
 )
 
 func pacific(t *testing.T) *time.Location {

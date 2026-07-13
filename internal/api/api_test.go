@@ -10,7 +10,7 @@ import (
 
 	"github.com/kayushkin/noteboard/internal/api"
 	"github.com/kayushkin/noteboard/internal/db"
-	"github.com/kayushkin/noteboard/internal/model"
+	"github.com/kayushkin/noteboard/model"
 )
 
 func setup(t *testing.T) (*api.API, func()) {

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kayushkin/noteboard/internal/model"
+	"github.com/kayushkin/noteboard/model"
 	_ "modernc.org/sqlite"
 )
 

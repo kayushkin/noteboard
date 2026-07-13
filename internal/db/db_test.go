@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kayushkin/noteboard/internal/model"
+	"github.com/kayushkin/noteboard/model"
 )
 
 // legacyTimeLayout is SQLite's own timestamp encoding, and the one
