@@ -86,6 +86,41 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 
+	// Reversible delete. SQLite has no ADD COLUMN IF NOT EXISTS, and this runs on
+	// every boot, so the duplicate-column error on re-run is expected and ignored
+	// — a failure here is not distinguishable from success, which is why the
+	// column is verified by the index below rather than by this error.
+	db.Exec(`ALTER TABLE items ADD COLUMN deleted_at DATETIME`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_items_deleted ON items(deleted_at)`); err != nil {
+		return fmt.Errorf("items.deleted_at missing (ALTER failed and this is not a re-run): %w", err)
+	}
+
+	// Prior state of every item, snapshotted before each mutation. Nothing in
+	// this store destroys data: DELETE sets deleted_at, and an UPDATE that
+	// overwrites a body leaves the old one here. A `workspace` is rewritten on
+	// every run of its job, so an agent that corrupts its own working memory
+	// would otherwise erase the accumulated judgment with no way back.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS item_revisions (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			item_id     TEXT NOT NULL,
+			title       TEXT NOT NULL,
+			body        TEXT DEFAULT '',
+			tags        TEXT DEFAULT '[]',
+			status      TEXT DEFAULT 'open',
+			priority    INTEGER DEFAULT 0,
+			list_id     TEXT DEFAULT '',
+			parent_id   TEXT,
+			links       TEXT DEFAULT '[]',
+			deleted_at  DATETIME,
+			reason      TEXT NOT NULL,
+			replaced_at DATETIME NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_item_revisions_item ON item_revisions(item_id, id DESC);
+	`); err != nil {
+		return err
+	}
+
 	// Create FTS table if not exists
 	var ftsExists int
 	db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='items_fts'").Scan(&ftsExists)
@@ -127,15 +162,20 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	// here instead of silently becoming the zero time.
 	var dueAt sql.NullTime
 	var parentID sql.NullString
+	var deletedAt sql.NullTime
 
 	err := row.Scan(
 		&item.ID, &item.Type, &item.Title, &item.Body,
 		&tagsJSON, &item.Priority, &item.Rank, &item.Status,
 		&item.ListID, &dueAt, &parentID, &linksJSON,
-		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt,
+		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &deletedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if deletedAt.Valid {
+		item.DeletedAt = &deletedAt.Time
 	}
 
 	json.Unmarshal([]byte(tagsJSON), &item.Tags)
@@ -159,7 +199,16 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	return &item, nil
 }
 
-const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at"
+// itemCols is the READ projection and includes deleted_at. insertCols is the
+// write set for a new row and deliberately does not: an item is never born
+// deleted, so the two lists are different sets rather than one list with a
+// NULL padded onto every INSERT.
+const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at"
+const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at"
+
+// notDeleted is the standing filter on every read path. A soft delete that any
+// list still returns is not a delete.
+const notDeleted = "deleted_at IS NULL"
 
 func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	now := time.Now().UTC()
@@ -213,7 +262,7 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	}
 
 	_, err := s.db.Exec(
-		"INSERT INTO items ("+itemCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		item.ID, item.Type, item.Title, item.Body,
 		string(tagsJSON), item.Priority, item.Rank, item.Status,
 		item.ListID, dueAt, item.ParentID, string(linksJSON),
@@ -225,15 +274,85 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	return item, nil
 }
 
+// GetItem returns a live item. A deleted item is not found — callers that
+// genuinely need one (restore, revision history) ask for it by name via
+// GetItemIncludingDeleted, so no caller returns a tombstone by accident.
 func (s *Store) GetItem(id string) (*model.Item, error) {
+	row := s.db.QueryRow("SELECT "+itemCols+" FROM items WHERE id = ? AND "+notDeleted, id)
+	return scanItem(row)
+}
+
+func (s *Store) GetItemIncludingDeleted(id string) (*model.Item, error) {
 	row := s.db.QueryRow("SELECT "+itemCols+" FROM items WHERE id = ?", id)
 	return scanItem(row)
+}
+
+// snapshot records the CURRENT state of an item before it is mutated, so every
+// change is reversible. Called inside the same transaction-less path as the
+// mutation it precedes: if the snapshot fails the mutation must not proceed,
+// because a change nobody can undo is exactly what this store no longer does.
+func (s *Store) snapshot(item *model.Item, reason string) error {
+	tagsJSON, _ := json.Marshal(item.Tags)
+	linksJSON, _ := json.Marshal(item.Links)
+	_, err := s.db.Exec(
+		`INSERT INTO item_revisions
+		   (item_id, title, body, tags, status, priority, list_id, parent_id, links, deleted_at, reason, replaced_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		item.ID, item.Title, item.Body, string(tagsJSON), item.Status, item.Priority,
+		item.ListID, item.ParentID, string(linksJSON), item.DeletedAt, reason, time.Now().UTC(),
+	)
+	return err
+}
+
+// ListRevisions returns an item's prior states, newest first.
+func (s *Store) ListRevisions(itemID string) ([]*model.Revision, error) {
+	rows, err := s.db.Query(
+		`SELECT id, item_id, title, body, tags, status, priority, list_id, parent_id, links, deleted_at, reason, replaced_at
+		   FROM item_revisions WHERE item_id = ? ORDER BY id DESC`, itemID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	revisions := []*model.Revision{}
+	for rows.Next() {
+		var rev model.Revision
+		var tagsJSON, linksJSON string
+		var parentID sql.NullString
+		var deletedAt sql.NullTime
+		if err := rows.Scan(
+			&rev.ID, &rev.ItemID, &rev.Title, &rev.Body, &tagsJSON, &rev.Status,
+			&rev.Priority, &rev.ListID, &parentID, &linksJSON, &deletedAt,
+			&rev.Reason, &rev.ReplacedAt,
+		); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(tagsJSON), &rev.Tags)
+		if rev.Tags == nil {
+			rev.Tags = []string{}
+		}
+		json.Unmarshal([]byte(linksJSON), &rev.Links)
+		if rev.Links == nil {
+			rev.Links = []string{}
+		}
+		if parentID.Valid {
+			rev.ParentID = &parentID.String
+		}
+		if deletedAt.Valid {
+			rev.DeletedAt = &deletedAt.Time
+		}
+		revisions = append(revisions, &rev)
+	}
+	return revisions, rows.Err()
 }
 
 func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item, error) {
 	existing, err := s.GetItem(id)
 	if err != nil {
 		return nil, err
+	}
+	if err := s.snapshot(existing, "update"); err != nil {
+		return nil, fmt.Errorf("snapshot before update: %w", err)
 	}
 
 	sets := []string{}
@@ -306,31 +425,85 @@ func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item
 	return s.GetItem(id)
 }
 
+// DeleteItem soft-deletes by stamping deleted_at. It no longer flips status to
+// 'archived': archived is a state the user chose for a LIVE item, and deletion
+// is the item being taken away. Collapsing the two meant a restore could not
+// tell "he archived this" from "this was deleted", and it made the archive a
+// dumping ground for things nobody meant to keep.
+//
+// `hard` still purges the row — kept for genuinely heavy data, not for ordinary
+// deletes. It snapshots first, so even a purge leaves the content recoverable
+// from item_revisions.
 func (s *Store) DeleteItem(id string, hard bool) error {
+	existing, err := s.GetItemIncludingDeleted(id)
+	if err != nil {
+		return err
+	}
+	reason := "delete"
+	if hard {
+		reason = "purge"
+	}
+	if err := s.snapshot(existing, reason); err != nil {
+		return fmt.Errorf("snapshot before %s: %w", reason, err)
+	}
+
 	if hard {
 		_, err := s.db.Exec("DELETE FROM items WHERE id = ?", id)
 		return err
 	}
-	_, err := s.db.Exec("UPDATE items SET status = 'archived', updated_at = ? WHERE id = ?", time.Now().UTC(), id)
+	if existing.DeletedAt != nil {
+		return nil // already deleted; don't move the tombstone's timestamp
+	}
+	now := time.Now().UTC()
+	_, err = s.db.Exec("UPDATE items SET deleted_at = ?, updated_at = ? WHERE id = ?", now, now, id)
 	return err
 }
 
+// RestoreItem clears the tombstone. The item returns in exactly the state it
+// was deleted in — status included, which is only possible because the delete
+// did not overwrite it.
+func (s *Store) RestoreItem(id string) (*model.Item, error) {
+	existing, err := s.GetItemIncludingDeleted(id)
+	if err != nil {
+		return nil, err
+	}
+	if existing.DeletedAt == nil {
+		return existing, nil
+	}
+	if err := s.snapshot(existing, "restore"); err != nil {
+		return nil, fmt.Errorf("snapshot before restore: %w", err)
+	}
+	if _, err := s.db.Exec("UPDATE items SET deleted_at = NULL, updated_at = ? WHERE id = ?", time.Now().UTC(), id); err != nil {
+		return nil, err
+	}
+	return s.GetItem(id)
+}
+
 type ListParams struct {
-	Type        string
-	Tag         string
-	ExcludeTags []string
-	Status      string
-	ListID      string
-	CreatedBy   string
-	Limit       int
-	Offset      int
-	Sort        string
+	Type           string
+	Tag            string
+	ExcludeTags    []string
+	Status         string
+	ListID         string
+	CreatedBy      string
+	ParentID       string
+	IncludeDeleted bool
+	Limit          int
+	Offset         int
+	Sort           string
 }
 
 func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 	where := []string{}
 	args := []interface{}{}
 
+	if !p.IncludeDeleted {
+		where = append(where, notDeleted)
+	}
+	if p.ParentID != "" {
+		where = append(where, "parent_id = ?")
+		args = append(args, p.ParentID)
+	}
 	if p.Type != "" {
 		where = append(where, "type = ?")
 		args = append(args, p.Type)
@@ -430,7 +603,7 @@ func (s *Store) Rerank(items []model.RerankItem) error {
 }
 
 func (s *Store) ListLists() ([]model.ListInfo, error) {
-	rows, err := s.db.Query("SELECT list_id, COUNT(*) as count FROM items WHERE list_id != '' AND status != 'archived' GROUP BY list_id ORDER BY list_id")
+	rows, err := s.db.Query("SELECT list_id, COUNT(*) as count FROM items WHERE list_id != '' AND status != 'archived' AND deleted_at IS NULL GROUP BY list_id ORDER BY list_id")
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +624,7 @@ func (s *Store) ListLists() ([]model.ListInfo, error) {
 }
 
 func (s *Store) ListTags() ([]model.TagInfo, error) {
-	rows, err := s.db.Query("SELECT j.value as tag, COUNT(*) as count FROM items, json_each(items.tags) as j WHERE items.status != 'archived' GROUP BY j.value ORDER BY count DESC")
+	rows, err := s.db.Query("SELECT j.value as tag, COUNT(*) as count FROM items, json_each(items.tags) as j WHERE items.status != 'archived' AND items.deleted_at IS NULL GROUP BY j.value ORDER BY count DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +653,7 @@ type SearchParams struct {
 }
 
 func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
-	where := []string{"items.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"}
+	where := []string{"items.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)", notDeleted}
 	args := []interface{}{p.Query}
 
 	if p.Type != "" {
@@ -525,6 +698,6 @@ func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
 
 func (s *Store) ItemCount() (int, error) {
 	var count int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM items WHERE status != 'archived'").Scan(&count)
+	err := s.db.QueryRow("SELECT COUNT(*) FROM items WHERE status != 'archived' AND deleted_at IS NULL").Scan(&count)
 	return count, err
 }

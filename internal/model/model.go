@@ -6,22 +6,69 @@ import (
 	"time"
 )
 
+// ItemType values. `workspace` is an agent's durable working memory: a
+// timestamped markdown document a recurring job rewrites each run. It is a
+// distinct type rather than a tagged `note` on purpose — a workspace is
+// rewritten forever and must never be mistakable for work to do (the todo queue
+// has already been flooded once) nor clutter the notes list. Being a type also
+// lets the schema enforce one workspace per job, which a convention cannot.
+const (
+	TypeNote      = "note"
+	TypeTodo      = "todo"
+	TypeRank      = "rank"
+	TypeWorkspace = "workspace"
+)
+
+func ValidType(t string) bool {
+	switch t {
+	case TypeNote, TypeTodo, TypeRank, TypeWorkspace:
+		return true
+	}
+	return false
+}
+
 type Item struct {
-	ID        string     `json:"id"`
-	Type      string     `json:"type"`
-	Title     string     `json:"title"`
-	Body      string     `json:"body"`
-	Tags      []string   `json:"tags"`
-	Priority  int        `json:"priority"`
-	Rank      float64    `json:"rank"`
-	Status    string     `json:"status"`
-	ListID    string     `json:"list_id"`
-	DueAt     *time.Time `json:"due_at,omitempty"`
-	ParentID  *string    `json:"parent_id,omitempty"`
-	Links     []string   `json:"links"`
+	ID       string     `json:"id"`
+	Type     string     `json:"type"`
+	Title    string     `json:"title"`
+	Body     string     `json:"body"`
+	Tags     []string   `json:"tags"`
+	Priority int        `json:"priority"`
+	Rank     float64    `json:"rank"`
+	Status   string     `json:"status"`
+	ListID   string     `json:"list_id"`
+	DueAt    *time.Time `json:"due_at,omitempty"`
+	ParentID *string    `json:"parent_id,omitempty"`
+	Links    []string   `json:"links"`
+	// DeletedAt is the reversible delete. It is deliberately NOT the `archived`
+	// status: archived is a state the user chose for a live item, deletion is
+	// the item being taken away. Overloading one onto the other (which DELETE
+	// used to do) means a restore cannot tell them apart.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 	CreatedBy string     `json:"created_by"`
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// Revision is the prior state of an item, snapshotted before every mutation.
+// Workspaces are rewritten on every job run, so an agent that corrupts its own
+// memory would otherwise destroy the accumulated judgment with no undo.
+type Revision struct {
+	ID        int64      `json:"id"`
+	ItemID    string     `json:"item_id"`
+	Title     string     `json:"title"`
+	Body      string     `json:"body"`
+	Tags      []string   `json:"tags"`
+	Status    string     `json:"status"`
+	Priority  int        `json:"priority"`
+	ListID    string     `json:"list_id"`
+	ParentID  *string    `json:"parent_id,omitempty"`
+	Links     []string   `json:"links"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// Reason names the mutation that produced this snapshot: update, delete,
+	// or restore.
+	Reason     string    `json:"reason"`
+	ReplacedAt time.Time `json:"replaced_at"`
 }
 
 type CreateItemRequest struct {
@@ -43,8 +90,8 @@ func (r *CreateItemRequest) Validate() error {
 	if r.Type == "" {
 		return fmt.Errorf("type is required")
 	}
-	if r.Type != "note" && r.Type != "todo" && r.Type != "rank" {
-		return fmt.Errorf("type must be note, todo, or rank")
+	if !ValidType(r.Type) {
+		return fmt.Errorf("type must be note, todo, rank, or workspace")
 	}
 	if r.Title == "" {
 		return fmt.Errorf("title is required")

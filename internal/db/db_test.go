@@ -68,7 +68,7 @@ func insertLegacyRow(t *testing.T, s *Store, id, title string, created time.Time
 	t.Helper()
 	stamp := created.Format(legacyTimeLayout)
 	_, err := s.db.Exec(
-		"INSERT INTO items ("+itemCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		id, "todo", title, "", "[]", 0, 0.0, "open", "", dueAt, nil, "[]", "", stamp, stamp,
 	)
 	if err != nil {
@@ -221,5 +221,110 @@ func TestDueAtRoundTripsThroughCreate(t *testing.T) {
 	}
 	if got.DueAt == nil || !got.DueAt.Equal(due) {
 		t.Errorf("DueAt = %v, want %v", got.DueAt, due)
+	}
+}
+
+// mustCreateTyped makes a live item of a given type/body for the reversibility
+// tests below. (mustCreate above is todo-only and title-only.)
+func mustCreateTyped(t *testing.T, s *Store, typ, title, body string) *model.Item {
+	t.Helper()
+	item, err := s.CreateItem(&model.CreateItemRequest{Type: typ, Title: title, Body: &body})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	return item
+}
+
+// A delete must be undoable. Nothing in this store destroys data, so a deleted
+// item leaves the row in place, disappears from every read path, and comes back
+// intact.
+func TestDeleteIsReversible(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeNote, "findable", "body")
+
+	if err := s.DeleteItem(item.ID, false); err != nil {
+		t.Fatalf("DeleteItem: %v", err)
+	}
+
+	if _, err := s.GetItem(item.ID); err == nil {
+		t.Fatal("GetItem returned a deleted item; a soft delete any read still returns is not a delete")
+	}
+	items, err := s.ListItems(ListParams{})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	for _, got := range items {
+		if got.ID == item.ID {
+			t.Fatal("ListItems returned a deleted item")
+		}
+	}
+	found, err := s.Search(SearchParams{Query: "findable"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	for _, got := range found {
+		if got.ID == item.ID {
+			t.Fatal("Search returned a deleted item — FTS is a read path too")
+		}
+	}
+
+	restored, err := s.RestoreItem(item.ID)
+	if err != nil {
+		t.Fatalf("RestoreItem: %v", err)
+	}
+	if restored.DeletedAt != nil {
+		t.Fatal("restored item still carries a tombstone")
+	}
+	if restored.Body != "body" {
+		t.Fatalf("restore lost the body: %q", restored.Body)
+	}
+}
+
+// The bug this replaced: DELETE used to set status='archived', so a restore
+// could not tell "the user archived this" from "this was deleted". Deletion
+// must leave the item's own state untouched.
+func TestDeleteDoesNotClobberStatus(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeTodo, "archived on purpose", "")
+	archived := "archived"
+	if _, err := s.UpdateItem(item.ID, &model.UpdateItemRequest{Status: &archived}); err != nil {
+		t.Fatalf("UpdateItem: %v", err)
+	}
+
+	if err := s.DeleteItem(item.ID, false); err != nil {
+		t.Fatalf("DeleteItem: %v", err)
+	}
+	restored, err := s.RestoreItem(item.ID)
+	if err != nil {
+		t.Fatalf("RestoreItem: %v", err)
+	}
+	if restored.Status != "archived" {
+		t.Fatalf("restore did not preserve the status the user chose: got %q, want archived", restored.Status)
+	}
+}
+
+// A workspace is rewritten on every run of its job, so an agent that corrupts
+// its own working memory must not be able to destroy what came before.
+func TestUpdateSnapshotsPriorBody(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeWorkspace, "deploy-guard memory", "## 2026-07-13\nfleet is stale")
+
+	wiped := ""
+	if _, err := s.UpdateItem(item.ID, &model.UpdateItemRequest{Body: &wiped}); err != nil {
+		t.Fatalf("UpdateItem: %v", err)
+	}
+
+	revisions, err := s.ListRevisions(item.ID)
+	if err != nil {
+		t.Fatalf("ListRevisions: %v", err)
+	}
+	if len(revisions) != 1 {
+		t.Fatalf("want 1 revision after one update, got %d", len(revisions))
+	}
+	if revisions[0].Body != "## 2026-07-13\nfleet is stale" {
+		t.Fatalf("prior body not recoverable: %q", revisions[0].Body)
+	}
+	if revisions[0].Reason != "update" {
+		t.Fatalf("revision reason = %q, want update", revisions[0].Reason)
 	}
 }
