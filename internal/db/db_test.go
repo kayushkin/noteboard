@@ -64,12 +64,16 @@ func rawText(t *testing.T, s *Store, col, id string) string {
 // timestamp columns as pre-formatted SQLite-format text, bound as a string so
 // nothing in the current driver touches the encoding. This is what all 4100
 // rows in the live database look like.
+//
+// schedule binds NULL, which is what a row predating that column genuinely holds
+// — ALTER TABLE ADD COLUMN backfills NULL — so these rows keep testing the real
+// legacy shape rather than a shape no row on disk has.
 func insertLegacyRow(t *testing.T, s *Store, id, title string, created time.Time, dueAt any) {
 	t.Helper()
 	stamp := created.Format(legacyTimeLayout)
 	_, err := s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		id, "todo", title, "", "[]", 0, 0.0, "open", "", dueAt, nil, "[]", "", stamp, stamp,
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		id, "todo", title, "", "[]", 0, 0.0, "open", "", dueAt, nil, "[]", "", stamp, stamp, nil,
 	)
 	if err != nil {
 		t.Fatalf("insert legacy row: %v", err)

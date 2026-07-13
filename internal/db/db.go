@@ -95,6 +95,17 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("items.deleted_at missing (ALTER failed and this is not a re-run): %w", err)
 	}
 
+	// Recurrence rule (RFC 5545), as JSON. Same ALTER-then-verify shape as
+	// deleted_at above: the duplicate-column error on re-run is expected and
+	// indistinguishable from success, so the partial index below is what actually
+	// proves the column landed. The index is not merely a probe — it is the one
+	// the coordinator scans on ("every item that has a rule"), which is a tiny
+	// slice of a table that is mostly unscheduled bot todos.
+	db.Exec(`ALTER TABLE items ADD COLUMN schedule TEXT`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_items_scheduled ON items(id) WHERE schedule IS NOT NULL`); err != nil {
+		return fmt.Errorf("items.schedule missing (ALTER failed and this is not a re-run): %w", err)
+	}
+
 	// Prior state of every item, snapshotted before each mutation. Nothing in
 	// this store destroys data: DELETE sets deleted_at, and an UPDATE that
 	// overwrites a body leaves the old one here. A `workspace` is rewritten on
@@ -163,12 +174,14 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var dueAt sql.NullTime
 	var parentID sql.NullString
 	var deletedAt sql.NullTime
+	var scheduleJSON sql.NullString
 
 	err := row.Scan(
 		&item.ID, &item.Type, &item.Title, &item.Body,
 		&tagsJSON, &item.Priority, &item.Rank, &item.Status,
 		&item.ListID, &dueAt, &parentID, &linksJSON,
 		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &deletedAt,
+		&scheduleJSON,
 	)
 	if err != nil {
 		return nil, err
@@ -176,6 +189,18 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 
 	if deletedAt.Valid {
 		item.DeletedAt = &deletedAt.Time
+	}
+	if scheduleJSON.Valid && scheduleJSON.String != "" {
+		// Unlike tags and links above, a malformed schedule is NOT swallowed. A
+		// tags blob that fails to parse degrades to an empty list and the item is
+		// still usable; a rule that fails to parse means the coordinator would
+		// expand it to nothing and silently remind nobody, forever. That failure
+		// is invisible by construction, so it has to be loud here.
+		var sched model.Schedule
+		if err := json.Unmarshal([]byte(scheduleJSON.String), &sched); err != nil {
+			return nil, fmt.Errorf("item %s has an unreadable schedule: %w", item.ID, err)
+		}
+		item.Schedule = &sched
 	}
 
 	json.Unmarshal([]byte(tagsJSON), &item.Tags)
@@ -203,8 +228,8 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 // write set for a new row and deliberately does not: an item is never born
 // deleted, so the two lists are different sets rather than one list with a
 // NULL padded onto every INSERT.
-const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at"
-const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at"
+const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at, schedule"
+const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, schedule"
 
 // notDeleted is the standing filter on every read path. A soft delete that any
 // list still returns is not a delete.
@@ -252,6 +277,9 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	if req.CreatedBy != nil {
 		item.CreatedBy = *req.CreatedBy
 	}
+	if req.Schedule != nil {
+		item.Schedule = req.Schedule
+	}
 
 	tagsJSON, _ := json.Marshal(item.Tags)
 	linksJSON, _ := json.Marshal(item.Links)
@@ -260,18 +288,36 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	if item.DueAt != nil {
 		dueAt = item.DueAt.Format(time.RFC3339)
 	}
+	schedule, err := marshalSchedule(item.Schedule)
+	if err != nil {
+		return nil, err
+	}
 
-	_, err := s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+	_, err = s.db.Exec(
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		item.ID, item.Type, item.Title, item.Body,
 		string(tagsJSON), item.Priority, item.Rank, item.Status,
 		item.ListID, dueAt, item.ParentID, string(linksJSON),
-		item.CreatedBy, item.CreatedAt, item.UpdatedAt,
+		item.CreatedBy, item.CreatedAt, item.UpdatedAt, schedule,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return item, nil
+}
+
+// marshalSchedule renders a schedule for storage. A nil schedule is stored as
+// SQL NULL rather than "null" or "{}", so "has a rule" is a property the partial
+// index can be built on and the coordinator can query for directly.
+func marshalSchedule(sched *model.Schedule) (interface{}, error) {
+	if sched == nil {
+		return nil, nil
+	}
+	j, err := json.Marshal(sched)
+	if err != nil {
+		return nil, fmt.Errorf("marshal schedule: %w", err)
+	}
+	return string(j), nil
 }
 
 // GetItem returns a live item. A deleted item is not found — callers that
@@ -391,9 +437,16 @@ func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item
 		sets = append(sets, "list_id = ?")
 		args = append(args, *req.ListID)
 	}
-	if req.DueAt != nil {
+	// due_at keys off HasDueAt, not non-nil, so an explicit `"due_at": null`
+	// clears the date. Non-nil alone made a due date unremovable, which a rolling
+	// schedule needs at the end of its series.
+	if req.HasDueAt {
 		sets = append(sets, "due_at = ?")
-		args = append(args, req.DueAt.Format(time.RFC3339))
+		if req.DueAt == nil {
+			args = append(args, nil)
+		} else {
+			args = append(args, req.DueAt.Format(time.RFC3339))
+		}
 	}
 	if req.ParentID != nil {
 		sets = append(sets, "parent_id = ?")
@@ -407,6 +460,33 @@ func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item
 		j, _ := json.Marshal(links)
 		sets = append(sets, "links = ?")
 		args = append(args, string(j))
+	}
+
+	// The anchor is checked against the MERGED item, not the request. A rule can
+	// anchor on the item's due date, so a PATCH that clears due_at while leaving a
+	// stored rule in place would strand that rule with nothing to count from — it
+	// would expand to nothing and silently stop reminding. Neither half of that
+	// PATCH looks wrong on its own; only the merge does.
+	mergedDueAt := existing.DueAt
+	if req.HasDueAt {
+		mergedDueAt = req.DueAt
+	}
+	mergedSchedule := existing.Schedule
+	if req.HasSchedule {
+		mergedSchedule = req.Schedule
+	}
+	if mergedSchedule != nil {
+		if _, err := mergedSchedule.Anchor(mergedDueAt); err != nil {
+			return nil, err
+		}
+	}
+	if req.HasSchedule {
+		schedule, err := marshalSchedule(req.Schedule)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, "schedule = ?")
+		args = append(args, schedule)
 	}
 
 	if len(sets) == 0 {
@@ -477,6 +557,35 @@ func (s *Store) RestoreItem(id string) (*model.Item, error) {
 		return nil, err
 	}
 	return s.GetItem(id)
+}
+
+// ListScheduledItems returns every live item carrying a recurrence rule, in the
+// order they were created. This is the reminder coordinator's scan: the set is a
+// tiny slice of a table that is overwhelmingly unscheduled bot todos, so it rides
+// the partial index rather than filtering the whole table in application code.
+//
+// Status is deliberately not filtered here. A `done` item can still be a live
+// recurring TEMPLATE — the template is not the work — and the coordinator has to
+// see it to keep generating occurrences. Deciding what a status means is the
+// coordinator's job, not the store's.
+func (s *Store) ListScheduledItems() ([]*model.Item, error) {
+	rows, err := s.db.Query(
+		"SELECT " + itemCols + " FROM items WHERE schedule IS NOT NULL AND " + notDeleted + " ORDER BY created_at",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []*model.Item{}
+	for rows.Next() {
+		item, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 type ListParams struct {

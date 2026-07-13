@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kayushkin/noteboard/internal/db"
 	"github.com/kayushkin/noteboard/internal/model"
@@ -138,9 +139,21 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "invalid JSON")
 			return
 		}
+		if err := req.Validate(); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
 		item, err := a.store.UpdateItem(id, &req)
 		if err != nil {
-			writeError(w, 404, "not found")
+			// A rejected schedule is a bad request, not a missing item. Collapsing
+			// every store error to 404 would report "not found" for an item that is
+			// plainly there, and hide the one message that says what is wrong with
+			// the rule.
+			if _, missing := a.store.GetItem(id); missing != nil {
+				writeError(w, 404, "not found")
+				return
+			}
+			writeError(w, 400, err.Error())
 			return
 		}
 		writeJSON(w, 200, item)
@@ -158,8 +171,8 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// itemAction serves the item sub-resources that make every mutation reversible:
-// the change log, and the undo.
+// itemAction serves the item sub-resources: the change log, the undo, and the
+// recurrence preview.
 func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action string) {
 	switch {
 	case action == "revisions" && r.Method == "GET":
@@ -176,9 +189,97 @@ func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action stri
 			return
 		}
 		writeJSON(w, 200, item)
+	case action == "occurrences" && r.Method == "GET":
+		a.occurrences(w, r, id)
 	default:
 		writeError(w, 404, "no such item action: "+action)
 	}
+}
+
+// occurrences expands an item's rule and answers the only question that matters
+// when you write one: "so when does this actually fire?"
+//
+// A recurrence rule is uniquely bad at failing visibly — BYDAY=3TU and
+// BYDAY=TU;BYSETPOS=3 both look plausible, and a wrong one does not error, it
+// just quietly reminds you on the wrong Tuesday, which you find out about a month
+// later. This endpoint makes the rule's behaviour checkable at the moment you
+// write it rather than at the moment it fails.
+//
+// Both due occurrences and nag firings are returned, because they are separately
+// wrong in different ways.
+func (a *API) occurrences(w http.ResponseWriter, r *http.Request, id string) {
+	item, err := a.store.GetItem(id)
+	if err != nil {
+		writeError(w, 404, "not found")
+		return
+	}
+	if item.Schedule == nil {
+		writeError(w, 400, "item has no schedule")
+		return
+	}
+
+	q := r.URL.Query()
+	from := time.Now()
+	if v := q.Get("from"); v != "" {
+		from, err = time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, 400, "from must be RFC3339: "+err.Error())
+			return
+		}
+	}
+	to := from.AddDate(1, 0, 0)
+	if v := q.Get("to"); v != "" {
+		to, err = time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, 400, "to must be RFC3339: "+err.Error())
+			return
+		}
+	}
+
+	due, err := item.Schedule.DueOccurrences(item.DueAt, from, to)
+	if err != nil {
+		writeError(w, 400, "expand due rule: "+err.Error())
+		return
+	}
+	nag, err := item.Schedule.NagOccurrences(item.DueAt, from, to)
+	if err != nil {
+		writeError(w, 400, "expand nag rule: "+err.Error())
+		return
+	}
+
+	// Capped, and the cap is REPORTED. A silently truncated preview is worse than
+	// no preview: it reads as "this is when it fires" while being a lie of
+	// omission, and a cadence bug hiding past item 500 would never be seen.
+	const maxOccurrences = 500
+	truncated := false
+	if len(due) > maxOccurrences {
+		due, truncated = due[:maxOccurrences], true
+	}
+	if len(nag) > maxOccurrences {
+		nag, truncated = nag[:maxOccurrences], true
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"item_id":   item.ID,
+		"tzid":      item.Schedule.TZID,
+		"mode":      item.Schedule.EffectiveMode(),
+		"from":      from.Format(time.RFC3339),
+		"to":        to.Format(time.RFC3339),
+		"due":       formatTimes(due),
+		"nag":       formatTimes(nag),
+		"truncated": truncated,
+	})
+}
+
+// formatTimes renders occurrences in the rule's own zone, so a reader checking
+// "is that 9am local?" can see the answer instead of doing offset arithmetic on
+// a UTC timestamp.
+func formatTimes(times []time.Time) []string {
+	out := make([]string, 0, len(times))
+	for _, t := range times {
+		out = append(out, t.Format(time.RFC3339))
+	}
+	return out
 }
 
 func (a *API) rerank(w http.ResponseWriter, r *http.Request) {

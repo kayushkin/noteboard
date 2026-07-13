@@ -40,6 +40,10 @@ type Item struct {
 	DueAt    *time.Time `json:"due_at,omitempty"`
 	ParentID *string    `json:"parent_id,omitempty"`
 	Links    []string   `json:"links"`
+	// Schedule is the recurrence RULE (see schedule.go). DueAt above stays the
+	// single source of truth for when this item is next due; Schedule is what
+	// generates that answer, not a second copy of it.
+	Schedule *Schedule `json:"schedule,omitempty"`
 	// DeletedAt is the reversible delete. It is deliberately NOT the `archived`
 	// status: archived is a state the user chose for a live item, deletion is
 	// the item being taken away. Overloading one onto the other (which DELETE
@@ -83,6 +87,7 @@ type CreateItemRequest struct {
 	DueAt     *time.Time `json:"due_at,omitempty"`
 	ParentID  *string    `json:"parent_id,omitempty"`
 	Links     []string   `json:"links,omitempty"`
+	Schedule  *Schedule  `json:"schedule,omitempty"`
 	CreatedBy *string    `json:"created_by,omitempty"`
 }
 
@@ -95,6 +100,16 @@ func (r *CreateItemRequest) Validate() error {
 	}
 	if r.Title == "" {
 		return fmt.Errorf("title is required")
+	}
+	if err := r.Schedule.Validate(); err != nil {
+		return err
+	}
+	// A rule with nothing to anchor on expands to nothing and would silently
+	// remind no one, so reject it here rather than at expansion time.
+	if r.Schedule != nil {
+		if _, err := r.Schedule.Anchor(r.DueAt); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -110,9 +125,12 @@ type UpdateItemRequest struct {
 	DueAt    *time.Time `json:"due_at,omitempty"`
 	ParentID *string    `json:"parent_id,omitempty"`
 	Links    []string   `json:"links,omitempty"`
+	Schedule *Schedule  `json:"schedule,omitempty"`
 	// Track which fields were explicitly set
-	HasTags  bool `json:"-"`
-	HasLinks bool `json:"-"`
+	HasTags     bool `json:"-"`
+	HasLinks    bool `json:"-"`
+	HasDueAt    bool `json:"-"`
+	HasSchedule bool `json:"-"`
 }
 
 func (r *UpdateItemRequest) UnmarshalJSON(data []byte) error {
@@ -131,7 +149,24 @@ func (r *UpdateItemRequest) UnmarshalJSON(data []byte) error {
 	if _, ok := raw["links"]; ok {
 		r.HasLinks = true
 	}
+	// due_at and schedule need presence tracking, not just non-nil, because
+	// `null` is a meaningful value for both: it is how you clear a due date or
+	// take a recurrence off an item. Without this, "unset it" is indistinguishable
+	// from "don't touch it" and a schedule could never be removed.
+	if _, ok := raw["due_at"]; ok {
+		r.HasDueAt = true
+	}
+	if _, ok := raw["schedule"]; ok {
+		r.HasSchedule = true
+	}
 	return nil
+}
+
+// Validate checks the shape of a schedule on update. The anchor cannot be checked
+// here — on a PATCH the due date it may anchor to lives on the stored item, not
+// in the request — so the store re-checks it against the merged item.
+func (r *UpdateItemRequest) Validate() error {
+	return r.Schedule.Validate()
 }
 
 type RerankRequest struct {
