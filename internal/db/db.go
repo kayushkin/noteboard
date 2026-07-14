@@ -268,6 +268,30 @@ const insertCols = "id, type, title, body, tags, priority, rank, status, list_id
 // list still returns is not a delete.
 const notDeleted = "deleted_at IS NULL"
 
+// heldSubtreeCTE names every item that is held, INCLUDING BY INHERITANCE: an item
+// whose parent (or grandparent, …) is held is itself withheld.
+//
+// A hold that stops the parent but not its children does not stop the work. The
+// autoworker's own prompt tells a worker that a too-large todo must be SPLIT into
+// child todos, so "park this task" has to mean "park the tree", or parking a task
+// is escapable by the very decomposition we asked for. The same holds for the
+// spend ceiling built on top of this: a $5 cap a child can walk around is not a
+// cap.
+//
+// The hold itself is stored on exactly one row and inherited at READ time. The
+// alternative — cascading a write down to every descendant — makes a second copy
+// of the truth, and then unhold has to guess which descendants were held on their
+// own account and which only inherited it.
+//
+// UNION (not UNION ALL) dedupes, so a parent_id cycle terminates instead of
+// spinning forever. Deleted rows cannot seed the set — a tombstone must not park
+// its live children.
+const heldSubtreeCTE = `WITH RECURSIVE held_subtree(id) AS (
+		SELECT id FROM items WHERE held_at IS NOT NULL AND deleted_at IS NULL
+		UNION
+		SELECT i.id FROM items i JOIN held_subtree h ON i.parent_id = h.id
+	)`
+
 // notHeld is the standing filter on every DISCOVERY path (list, search) — the
 // paths an agent uses to find work it was not handed. It is deliberately absent
 // from GetItem: fetching by id is not discovery, and a caller holding the id has
@@ -278,7 +302,9 @@ const notDeleted = "deleted_at IS NULL"
 // added later that knows nothing about the gate silently bypasses it. There are
 // already five consumers (autoworker, dispatcher, scoper, classifier, reviewer),
 // and the one that forgets is the one that picks up the parked work.
-const notHeld = "held_at IS NULL"
+//
+// Requires heldSubtreeCTE to be prepended to the query.
+const notHeld = "items.id NOT IN (SELECT id FROM held_subtree)"
 
 func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	now := time.Now().UTC()
@@ -770,7 +796,12 @@ func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 		args = append(args, p.CreatedBy)
 	}
 
+	// The held-subtree CTE is only prepended when the hold filter is actually in
+	// play. A caller asking to SEE held work should not pay for the recursion.
 	q := "SELECT " + itemCols + " FROM items"
+	if !p.IncludeHeld {
+		q = heldSubtreeCTE + " " + q
+	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -921,6 +952,9 @@ func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
 	}
 
 	q := fmt.Sprintf("SELECT %s FROM items WHERE %s ORDER BY created_at DESC LIMIT %d", itemCols, strings.Join(where, " AND "), limit)
+	if !p.IncludeHeld {
+		q = heldSubtreeCTE + " " + q
+	}
 
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

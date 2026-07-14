@@ -549,3 +549,95 @@ func TestNegativeSpendCeilingRejected(t *testing.T) {
 		t.Fatal("a negative spend ceiling was accepted")
 	}
 }
+
+// TestHoldIsInheritedByChildren is the escape hatch this closes. The autoworker's
+// own prompt instructs a worker that a too-large todo must be SPLIT into child
+// todos — so if a hold stopped the parent but not its children, "park this task"
+// would be escapable by exactly the decomposition we asked for, and the spend
+// ceiling built on top of the hold would be escapable with it.
+func TestHoldIsInheritedByChildren(t *testing.T) {
+	s := newTestStore(t)
+	parent := mustCreate(t, s, "parent")
+	child, err := s.CreateItem(&model.CreateItemRequest{
+		Type: "todo", Title: "child", ParentID: &parent.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateItem(child): %v", err)
+	}
+	grandchild, err := s.CreateItem(&model.CreateItemRequest{
+		Type: "todo", Title: "grandchild", ParentID: &child.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateItem(grandchild): %v", err)
+	}
+
+	// Before the hold, everything is workable.
+	if items, _ := s.ListItems(ListParams{Type: "todo"}); len(items) != 3 {
+		t.Fatalf("expected 3 workable todos before the hold, got %d", len(items))
+	}
+
+	if _, err := s.HoldItem(parent.ID, "spend ceiling reached"); err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+
+	items, err := s.ListItems(ListParams{Type: "todo"})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 0 {
+		var leaked []string
+		for _, i := range items {
+			leaked = append(leaked, i.Title)
+		}
+		t.Fatalf("holding the parent left %v dispatchable — a held task is escapable via its children", leaked)
+	}
+
+	// Search is a discovery path too.
+	if found, _ := s.Search(SearchParams{Query: "grandchild"}); len(found) != 0 {
+		t.Fatal("search returned the grandchild of a held parent")
+	}
+
+	// The hold lives on ONE row. The children are withheld by inheritance, not by
+	// a cascaded write — nothing to go stale, and unhold needs no bookkeeping to
+	// know which descendants were only ever held on the parent's account.
+	got, err := s.GetItem(grandchild.ID)
+	if err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if got.Held() {
+		t.Error("the hold was cascaded onto the grandchild's own row; it should be inherited at read time")
+	}
+
+	// Releasing the parent releases the tree.
+	if _, err := s.UnholdItem(parent.ID); err != nil {
+		t.Fatalf("UnholdItem: %v", err)
+	}
+	if items, _ := s.ListItems(ListParams{Type: "todo"}); len(items) != 3 {
+		t.Fatalf("unholding the parent should free the whole tree, got %d workable", len(items))
+	}
+}
+
+// A parent_id cycle must not hang the query. UNION dedupes, so the recursion
+// terminates; UNION ALL would spin forever and take every read path with it.
+func TestHoldInheritanceSurvivesAParentCycle(t *testing.T) {
+	s := newTestStore(t)
+	a := mustCreate(t, s, "a")
+	b, err := s.CreateItem(&model.CreateItemRequest{Type: "todo", Title: "b", ParentID: &a.ID})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	// Close the loop behind the API's back: a -> b -> a.
+	if _, err := s.db.Exec("UPDATE items SET parent_id = ? WHERE id = ?", b.ID, a.ID); err != nil {
+		t.Fatalf("create cycle: %v", err)
+	}
+	if _, err := s.HoldItem(a.ID, "cycle"); err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+	items, err := s.ListItems(ListParams{Type: "todo"})
+	if err != nil {
+		t.Fatalf("ListItems over a cycle: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("both items in the cycle should be withheld, got %d", len(items))
+	}
+}
