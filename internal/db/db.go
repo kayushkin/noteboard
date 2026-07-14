@@ -106,6 +106,15 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("items.schedule missing (ALTER failed and this is not a re-run): %w", err)
 	}
 
+	// The agent gate. Same ALTER-then-verify shape as the two above. The partial
+	// index names BOTH new columns, so it fails unless both landed — an index on
+	// held_at alone would prove nothing about hold_reason.
+	db.Exec(`ALTER TABLE items ADD COLUMN held_at DATETIME`)
+	db.Exec(`ALTER TABLE items ADD COLUMN hold_reason TEXT DEFAULT ''`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_items_held ON items(id, hold_reason) WHERE held_at IS NOT NULL`); err != nil {
+		return fmt.Errorf("items.held_at/hold_reason missing (ALTER failed and this is not a re-run): %w", err)
+	}
+
 	// Prior state of every item, snapshotted before each mutation. Nothing in
 	// this store destroys data: DELETE sets deleted_at, and an UPDATE that
 	// overwrites a body leaves the old one here. A `workspace` is rewritten on
@@ -175,13 +184,15 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var parentID sql.NullString
 	var deletedAt sql.NullTime
 	var scheduleJSON sql.NullString
+	var heldAt sql.NullTime
+	var holdReason sql.NullString
 
 	err := row.Scan(
 		&item.ID, &item.Type, &item.Title, &item.Body,
 		&tagsJSON, &item.Priority, &item.Rank, &item.Status,
 		&item.ListID, &dueAt, &parentID, &linksJSON,
 		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &deletedAt,
-		&scheduleJSON,
+		&scheduleJSON, &heldAt, &holdReason,
 	)
 	if err != nil {
 		return nil, err
@@ -189,6 +200,12 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 
 	if deletedAt.Valid {
 		item.DeletedAt = &deletedAt.Time
+	}
+	if heldAt.Valid {
+		item.HeldAt = &heldAt.Time
+	}
+	if holdReason.Valid {
+		item.HoldReason = holdReason.String
 	}
 	if scheduleJSON.Valid && scheduleJSON.String != "" {
 		// Unlike tags and links above, a malformed schedule is NOT swallowed. A
@@ -228,12 +245,24 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 // write set for a new row and deliberately does not: an item is never born
 // deleted, so the two lists are different sets rather than one list with a
 // NULL padded onto every INSERT.
-const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at, schedule"
-const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, schedule"
+const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at, schedule, held_at, hold_reason"
+const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, schedule, held_at, hold_reason"
 
 // notDeleted is the standing filter on every read path. A soft delete that any
 // list still returns is not a delete.
 const notDeleted = "deleted_at IS NULL"
+
+// notHeld is the standing filter on every DISCOVERY path (list, search) — the
+// paths an agent uses to find work it was not handed. It is deliberately absent
+// from GetItem: fetching by id is not discovery, and a caller holding the id has
+// already been handed the item.
+//
+// Excluding held items by DEFAULT is the whole design. The alternative — an
+// opt-in filter every consumer must remember to pass — fails open: a consumer
+// added later that knows nothing about the gate silently bypasses it. There are
+// already five consumers (autoworker, dispatcher, scoper, classifier, reviewer),
+// and the one that forgets is the one that picks up the parked work.
+const notHeld = "held_at IS NULL"
 
 func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 	now := time.Now().UTC()
@@ -293,12 +322,22 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 		return nil, err
 	}
 
+	// Born held, in the same INSERT — not created and then held in a second
+	// write, which would leave a window in which an agent could list the item.
+	var heldAt interface{}
+	if req.Hold {
+		item.HeldAt = &now
+		item.HoldReason = req.HoldReason
+		heldAt = now
+	}
+
 	_, err = s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		item.ID, item.Type, item.Title, item.Body,
 		string(tagsJSON), item.Priority, item.Rank, item.Status,
 		item.ListID, dueAt, item.ParentID, string(linksJSON),
 		item.CreatedBy, item.CreatedAt, item.UpdatedAt, schedule,
+		heldAt, item.HoldReason,
 	)
 	if err != nil {
 		return nil, err
@@ -559,6 +598,54 @@ func (s *Store) RestoreItem(id string) (*model.Item, error) {
 	return s.GetItem(id)
 }
 
+// HoldItem parks an item: it stays open and visible to the user, and drops out
+// of every agent discovery path until it is cleared. Re-holding an already-held
+// item does not move its timestamp — the hold dates from when it was first
+// applied, not from the last time someone pressed the button.
+func (s *Store) HoldItem(id, reason string) (*model.Item, error) {
+	existing, err := s.GetItem(id)
+	if err != nil {
+		return nil, err
+	}
+	if existing.HeldAt != nil {
+		return existing, nil
+	}
+	if err := s.snapshot(existing, "hold"); err != nil {
+		return nil, fmt.Errorf("snapshot before hold: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.db.Exec(
+		"UPDATE items SET held_at = ?, hold_reason = ?, updated_at = ? WHERE id = ?",
+		now, reason, now, id,
+	); err != nil {
+		return nil, err
+	}
+	return s.GetItem(id)
+}
+
+// UnholdItem clears the gate — the item becomes agent-visible again. The reason
+// is cleared with it: a stale "why this was parked" on live work is worse than
+// none, because it reads as if the gate were still closed.
+func (s *Store) UnholdItem(id string) (*model.Item, error) {
+	existing, err := s.GetItem(id)
+	if err != nil {
+		return nil, err
+	}
+	if existing.HeldAt == nil {
+		return existing, nil
+	}
+	if err := s.snapshot(existing, "unhold"); err != nil {
+		return nil, fmt.Errorf("snapshot before unhold: %w", err)
+	}
+	if _, err := s.db.Exec(
+		"UPDATE items SET held_at = NULL, hold_reason = '', updated_at = ? WHERE id = ?",
+		time.Now().UTC(), id,
+	); err != nil {
+		return nil, err
+	}
+	return s.GetItem(id)
+}
+
 // ListScheduledItems returns every live item carrying a recurrence rule, in the
 // order they were created. This is the reminder coordinator's scan: the set is a
 // tiny slice of a table that is overwhelmingly unscheduled bot todos, so it rides
@@ -597,9 +684,13 @@ type ListParams struct {
 	CreatedBy      string
 	ParentID       string
 	IncludeDeleted bool
-	Limit          int
-	Offset         int
-	Sort           string
+	// IncludeHeld surfaces parked work. Default false, so a caller that has never
+	// heard of the gate cannot pick up held work. The surfaces that exist to
+	// manage the hold — the kanban board, the notes UI — set it to true.
+	IncludeHeld bool
+	Limit       int
+	Offset      int
+	Sort        string
 }
 
 func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
@@ -608,6 +699,9 @@ func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 
 	if !p.IncludeDeleted {
 		where = append(where, notDeleted)
+	}
+	if !p.IncludeHeld {
+		where = append(where, notHeld)
 	}
 	if p.ParentID != "" {
 		where = append(where, "parent_id = ?")
@@ -759,11 +853,19 @@ type SearchParams struct {
 	Tag    string
 	Status string
 	Limit  int
+	// IncludeHeld surfaces parked work. Search is a discovery path — an agent
+	// told "find the todo about X" would otherwise route around the gate that
+	// ListItems closes.
+	IncludeHeld bool
 }
 
 func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
 	where := []string{"items.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)", notDeleted}
 	args := []interface{}{p.Query}
+
+	if !p.IncludeHeld {
+		where = append(where, notHeld)
+	}
 
 	if p.Type != "" {
 		where = append(where, "type = ?")

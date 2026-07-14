@@ -49,10 +49,27 @@ type Item struct {
 	// the item being taken away. Overloading one onto the other (which DELETE
 	// used to do) means a restore cannot tell them apart.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
-	CreatedBy string     `json:"created_by"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	// HeldAt is the agent gate: work the user has parked. A held item stays
+	// `open` and stays visible to humans — it is withheld from agent read paths,
+	// which exclude held items by default (see db.ListParams.IncludeHeld).
+	//
+	// Hold is deliberately NOT a `status`. Status is the work's lifecycle; hold
+	// is who is allowed to act on it, and an item can legitimately be open AND
+	// held. Collapsing them would hide parked work from the user's own open-todo
+	// list, which is the opposite of what parking it means.
+	//
+	// It is also deliberately not a kanban column. A column gates only the one
+	// consumer that reads that column, so a card must be pausable in ANY stage
+	// rather than only by being dragged into a designated gate column.
+	HeldAt     *time.Time `json:"held_at,omitempty"`
+	HoldReason string     `json:"hold_reason,omitempty"`
+	CreatedBy  string     `json:"created_by"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
+
+// Held reports whether an item is withheld from agents.
+func (i *Item) Held() bool { return i.HeldAt != nil }
 
 // Revision is the prior state of an item, snapshotted before every mutation.
 // Workspaces are rewritten on every job run, so an agent that corrupts its own
@@ -89,6 +106,11 @@ type CreateItemRequest struct {
 	Links     []string   `json:"links,omitempty"`
 	Schedule  *Schedule  `json:"schedule,omitempty"`
 	CreatedBy *string    `json:"created_by,omitempty"`
+	// Hold creates the item already parked, so there is no window between
+	// creation and the gate closing in which an agent could pick it up. Opt-in:
+	// the caller that knows the work is sensitive asks for it.
+	Hold       bool   `json:"hold,omitempty"`
+	HoldReason string `json:"hold_reason,omitempty"`
 }
 
 func (r *CreateItemRequest) Validate() error {

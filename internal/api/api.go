@@ -74,6 +74,7 @@ func (a *API) items(w http.ResponseWriter, r *http.Request) {
 			CreatedBy:      q.Get("created_by"),
 			ParentID:       q.Get("parent_id"),
 			IncludeDeleted: q.Get("include_deleted") == "true",
+			IncludeHeld:    q.Get("include_held") == "true",
 			Limit:          limit,
 			Offset:         offset,
 			Sort:           q.Get("sort"),
@@ -184,6 +185,26 @@ func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action stri
 		writeJSON(w, 200, revisions)
 	case action == "restore" && r.Method == "POST":
 		item, err := a.store.RestoreItem(id)
+		if err != nil {
+			writeError(w, 404, "not found")
+			return
+		}
+		writeJSON(w, 200, item)
+	case action == "hold" && r.Method == "POST":
+		// Body is optional: holding without a stated reason is allowed, because a
+		// gate that is annoying to close is a gate that stays open.
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		item, err := a.store.HoldItem(id, req.Reason)
+		if err != nil {
+			writeError(w, 404, "not found")
+			return
+		}
+		writeJSON(w, 200, item)
+	case action == "unhold" && r.Method == "POST":
+		item, err := a.store.UnholdItem(id)
 		if err != nil {
 			writeError(w, 404, "not found")
 			return
@@ -348,11 +369,12 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	items, err := a.store.Search(db.SearchParams{
-		Query:  query,
-		Type:   q.Get("type"),
-		Tag:    q.Get("tag"),
-		Status: q.Get("status"),
-		Limit:  limit,
+		Query:       query,
+		Type:        q.Get("type"),
+		Tag:         q.Get("tag"),
+		Status:      q.Get("status"),
+		Limit:       limit,
+		IncludeHeld: q.Get("include_held") == "true",
 	})
 	if err != nil {
 		writeError(w, 500, err.Error())

@@ -65,15 +65,19 @@ func rawText(t *testing.T, s *Store, col, id string) string {
 // nothing in the current driver touches the encoding. This is what all 4100
 // rows in the live database look like.
 //
-// schedule binds NULL, which is what a row predating that column genuinely holds
-// — ALTER TABLE ADD COLUMN backfills NULL — so these rows keep testing the real
-// legacy shape rather than a shape no row on disk has.
+// schedule and held_at bind NULL, and hold_reason binds the empty string its
+// column defaults to — which is exactly what a row predating those columns holds,
+// since ALTER TABLE ADD COLUMN backfills the declared default. So these rows keep
+// testing the real legacy shape rather than a shape no row on disk has. A legacy
+// row is therefore un-held, which is the right default: the gate did not exist
+// when it was written.
 func insertLegacyRow(t *testing.T, s *Store, id, title string, created time.Time, dueAt any) {
 	t.Helper()
 	stamp := created.Format(legacyTimeLayout)
 	_, err := s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		id, "todo", title, "", "[]", 0, 0.0, "open", "", dueAt, nil, "[]", "", stamp, stamp, nil,
+		nil, "",
 	)
 	if err != nil {
 		t.Fatalf("insert legacy row: %v", err)
@@ -330,5 +334,138 @@ func TestUpdateSnapshotsPriorBody(t *testing.T) {
 	}
 	if revisions[0].Reason != "update" {
 		t.Fatalf("revision reason = %q, want update", revisions[0].Reason)
+	}
+}
+
+// TestHeldItemsAreWithheldFromDiscoveryByDefault is the guard on the agent gate.
+// The whole point of the design is that it fails SAFE: a caller that passes no
+// hold-related parameter at all — i.e. every consumer written before the gate
+// existed, and every one written after by someone who never heard of it — must
+// not see parked work. If this test ever needs an explicit "exclude held" flag
+// added to make it pass, the gate has been inverted into an opt-in convention
+// and no longer gates anything.
+func TestHeldItemsAreWithheldFromDiscoveryByDefault(t *testing.T) {
+	s := newTestStore(t)
+	open := mustCreate(t, s, "free to work")
+	parked := mustCreate(t, s, "parked, do not touch")
+
+	if _, err := s.HoldItem(parked.ID, "sends email"); err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+
+	// List: the autoworker's discovery path.
+	items, err := s.ListItems(ListParams{Type: "todo"})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	for _, it := range items {
+		if it.ID == parked.ID {
+			t.Fatal("ListItems returned a held item with no include_held — the gate is open")
+		}
+	}
+	if len(items) != 1 || items[0].ID != open.ID {
+		t.Fatalf("want only the un-held item, got %d items", len(items))
+	}
+
+	// Search: the other way an agent finds work it was not handed.
+	found, err := s.Search(SearchParams{Query: "parked"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(found) != 0 {
+		t.Fatalf("Search routed around the gate and returned %d held item(s)", len(found))
+	}
+}
+
+// TestHoldIsVisibleToCallersThatAskForIt covers the surfaces that manage the
+// gate — the kanban board and the notes UI cannot offer a "resume" button for a
+// card they are not allowed to see.
+func TestHoldIsVisibleToCallersThatAskForIt(t *testing.T) {
+	s := newTestStore(t)
+	parked := mustCreate(t, s, "parked")
+	if _, err := s.HoldItem(parked.ID, "sends email"); err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+
+	items, err := s.ListItems(ListParams{Type: "todo", IncludeHeld: true})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 1 || !items[0].Held() || items[0].HoldReason != "sends email" {
+		t.Fatalf("include_held must return the item with its reason intact, got %+v", items)
+	}
+
+	// Fetching by id is not discovery: a caller holding the id was handed the
+	// item, so the gate does not apply.
+	got, err := s.GetItem(parked.ID)
+	if err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if !got.Held() {
+		t.Fatal("GetItem lost the hold")
+	}
+}
+
+// TestHoldDoesNotTouchStatus is the reason hold is its own field. A parked todo
+// is still open work the user wants to see in their own list; if hold were a
+// status, parking it would delete it from that list.
+func TestHoldDoesNotTouchStatus(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreate(t, s, "parked but still open")
+	held, err := s.HoldItem(item.ID, "")
+	if err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+	if held.Status != "open" {
+		t.Fatalf("hold rewrote status to %q; hold is permission, status is lifecycle", held.Status)
+	}
+
+	cleared, err := s.UnholdItem(item.ID)
+	if err != nil {
+		t.Fatalf("UnholdItem: %v", err)
+	}
+	if cleared.Held() || cleared.HoldReason != "" || cleared.Status != "open" {
+		t.Fatalf("unhold must clear held_at and the reason and leave status alone, got %+v", cleared)
+	}
+}
+
+// TestCreateHeldLeavesNoWindow: an item born held must never have existed in a
+// listable state, or an agent ticking every 5 minutes can win the race between
+// "create" and "then hold it".
+func TestCreateHeldLeavesNoWindow(t *testing.T) {
+	s := newTestStore(t)
+	item, err := s.CreateItem(&model.CreateItemRequest{
+		Type: "todo", Title: "email blast", Hold: true, HoldReason: "sends email",
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if !item.Held() || item.HoldReason != "sends email" {
+		t.Fatalf("create with hold must return a held item, got %+v", item)
+	}
+	items, err := s.ListItems(ListParams{Type: "todo"})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatal("an item created held was listable")
+	}
+}
+
+// TestReHoldingDoesNotMoveTheTimestamp — the hold dates from when the work was
+// parked, not from the last time a UI re-sent the button press.
+func TestReHoldingDoesNotMoveTheTimestamp(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreate(t, s, "parked")
+	first, err := s.HoldItem(item.ID, "first reason")
+	if err != nil {
+		t.Fatalf("HoldItem: %v", err)
+	}
+	again, err := s.HoldItem(item.ID, "second reason")
+	if err != nil {
+		t.Fatalf("HoldItem (re-hold): %v", err)
+	}
+	if !again.HeldAt.Equal(*first.HeldAt) || again.HoldReason != "first reason" {
+		t.Fatalf("re-hold overwrote the original hold: %+v", again)
 	}
 }
