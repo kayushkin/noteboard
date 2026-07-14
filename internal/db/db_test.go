@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -75,9 +76,9 @@ func insertLegacyRow(t *testing.T, s *Store, id, title string, created time.Time
 	t.Helper()
 	stamp := created.Format(legacyTimeLayout)
 	_, err := s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		id, "todo", title, "", "[]", 0, 0.0, "open", "", dueAt, nil, "[]", "", stamp, stamp, nil,
-		nil, "",
+		nil, "", nil,
 	)
 	if err != nil {
 		t.Fatalf("insert legacy row: %v", err)
@@ -467,5 +468,84 @@ func TestReHoldingDoesNotMoveTheTimestamp(t *testing.T) {
 	}
 	if !again.HeldAt.Equal(*first.HeldAt) || again.HoldReason != "first reason" {
 		t.Fatalf("re-hold overwrote the original hold: %+v", again)
+	}
+}
+
+// TestSpendCeilingDistinguishesZeroFromUnset is the trap this field is built to
+// avoid. NULL means "no ceiling"; 0.0 means "hold before spending a cent". A
+// plain float64 column with DEFAULT 0 would collapse the two and silently arm a
+// ceiling on every one of the ~4100 rows that predate the feature.
+func TestSpendCeilingDistinguishesZeroFromUnset(t *testing.T) {
+	s := newTestStore(t)
+
+	none := mustCreate(t, s, "no ceiling")
+	if none.AutoHoldAtUSD != nil {
+		t.Fatalf("a plain item must have NO ceiling, got %v", *none.AutoHoldAtUSD)
+	}
+
+	zero := 0.0
+	armed, err := s.CreateItem(&model.CreateItemRequest{
+		Type: "todo", Title: "zero ceiling", AutoHoldAtUSD: &zero,
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if armed.AutoHoldAtUSD == nil {
+		t.Fatal("a ceiling of 0 was stored as 'no ceiling' — zero and unset have collapsed")
+	}
+	if *armed.AutoHoldAtUSD != 0 {
+		t.Fatalf("ceiling = %v, want 0", *armed.AutoHoldAtUSD)
+	}
+}
+
+// TestSpendCeilingCanBeClearedWithNull — a ceiling you cannot take off is one
+// you can only escape by deleting the item.
+func TestSpendCeilingCanBeClearedWithNull(t *testing.T) {
+	s := newTestStore(t)
+	ten := 10.0
+	item, err := s.CreateItem(&model.CreateItemRequest{
+		Type: "todo", Title: "capped", AutoHoldAtUSD: &ten,
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	// An unrelated PATCH must not disturb the ceiling.
+	var req model.UpdateItemRequest
+	if err := json.Unmarshal([]byte(`{"title":"renamed"}`), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	touched, err := s.UpdateItem(item.ID, &req)
+	if err != nil {
+		t.Fatalf("UpdateItem: %v", err)
+	}
+	if touched.AutoHoldAtUSD == nil || *touched.AutoHoldAtUSD != 10 {
+		t.Fatalf("an unrelated PATCH dropped the ceiling: %v", touched.AutoHoldAtUSD)
+	}
+
+	// An explicit null clears it.
+	var clear model.UpdateItemRequest
+	if err := json.Unmarshal([]byte(`{"auto_hold_at_usd":null}`), &clear); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !clear.HasAutoHoldAtUSD {
+		t.Fatal("explicit null did not register as present — it reads as 'leave alone'")
+	}
+	cleared, err := s.UpdateItem(item.ID, &clear)
+	if err != nil {
+		t.Fatalf("UpdateItem(null): %v", err)
+	}
+	if cleared.AutoHoldAtUSD != nil {
+		t.Fatalf("null did not clear the ceiling: %v", *cleared.AutoHoldAtUSD)
+	}
+}
+
+// TestNegativeSpendCeilingRejected — a negative ceiling is breached the instant
+// it is set, arming a gate that can never open.
+func TestNegativeSpendCeilingRejected(t *testing.T) {
+	neg := -1.0
+	req := &model.CreateItemRequest{Type: "todo", Title: "bad", AutoHoldAtUSD: &neg}
+	if err := req.Validate(); err == nil {
+		t.Fatal("a negative spend ceiling was accepted")
 	}
 }

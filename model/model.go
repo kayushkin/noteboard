@@ -63,9 +63,25 @@ type Item struct {
 	// rather than only by being dragged into a designated gate column.
 	HeldAt     *time.Time `json:"held_at,omitempty"`
 	HoldReason string     `json:"hold_reason,omitempty"`
-	CreatedBy  string     `json:"created_by"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	// AutoHoldAtUSD is the spend ceiling for this item: once the cumulative cost
+	// of the agent sessions that worked it reaches this many dollars, it is held
+	// automatically. Nil = no ceiling (the default; this is opt-in).
+	//
+	// The dollars spent are deliberately NOT stored here. Cost lives in
+	// llm-bridge's session aggregates and the item's session links are the join
+	// — a copy kept on the item would be a second source of truth that goes stale
+	// the moment a session bills another turn.
+	//
+	// This one number drives two enforcement points, which is why it is one number:
+	// the dispatcher hands the harness a per-session cap of (ceiling - already
+	// spent), so no single session can push the item past the ceiling, and the
+	// curator holds the item once the cumulative total reaches it. The per-session
+	// cap is what makes the polled cumulative check safe: without it a fast burner
+	// could blow far past the ceiling between two polls.
+	AutoHoldAtUSD *float64  `json:"auto_hold_at_usd,omitempty"`
+	CreatedBy     string    `json:"created_by"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Held reports whether an item is withheld from agents.
@@ -111,6 +127,8 @@ type CreateItemRequest struct {
 	// the caller that knows the work is sensitive asks for it.
 	Hold       bool   `json:"hold,omitempty"`
 	HoldReason string `json:"hold_reason,omitempty"`
+	// AutoHoldAtUSD arms the spend ceiling at creation. Nil = no ceiling.
+	AutoHoldAtUSD *float64 `json:"auto_hold_at_usd,omitempty"`
 }
 
 func (r *CreateItemRequest) Validate() error {
@@ -133,6 +151,11 @@ func (r *CreateItemRequest) Validate() error {
 			return err
 		}
 	}
+	// A negative ceiling is already breached the moment it is set, so it would
+	// arm a gate that can never open. Reject it rather than store nonsense.
+	if r.AutoHoldAtUSD != nil && *r.AutoHoldAtUSD < 0 {
+		return fmt.Errorf("auto_hold_at_usd must not be negative (got %v)", *r.AutoHoldAtUSD)
+	}
 	return nil
 }
 
@@ -148,11 +171,14 @@ type UpdateItemRequest struct {
 	ParentID *string    `json:"parent_id,omitempty"`
 	Links    []string   `json:"links,omitempty"`
 	Schedule *Schedule  `json:"schedule,omitempty"`
+	// AutoHoldAtUSD is the spend ceiling. `null` clears it (see HasAutoHoldAtUSD).
+	AutoHoldAtUSD *float64 `json:"auto_hold_at_usd,omitempty"`
 	// Track which fields were explicitly set
-	HasTags     bool `json:"-"`
-	HasLinks    bool `json:"-"`
-	HasDueAt    bool `json:"-"`
-	HasSchedule bool `json:"-"`
+	HasTags          bool `json:"-"`
+	HasLinks         bool `json:"-"`
+	HasDueAt         bool `json:"-"`
+	HasSchedule      bool `json:"-"`
+	HasAutoHoldAtUSD bool `json:"-"`
 }
 
 func (r *UpdateItemRequest) UnmarshalJSON(data []byte) error {
@@ -180,6 +206,12 @@ func (r *UpdateItemRequest) UnmarshalJSON(data []byte) error {
 	}
 	if _, ok := raw["schedule"]; ok {
 		r.HasSchedule = true
+	}
+	// Same reason as due_at and schedule: `null` is how you REMOVE a spend
+	// ceiling, and it must not read as "leave it alone". A ceiling that cannot
+	// be taken off is a ceiling you can only escape by deleting the item.
+	if _, ok := raw["auto_hold_at_usd"]; ok {
+		r.HasAutoHoldAtUSD = true
 	}
 	return nil
 }

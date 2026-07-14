@@ -115,6 +115,15 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("items.held_at/hold_reason missing (ALTER failed and this is not a re-run): %w", err)
 	}
 
+	// Spend ceiling. NULL (not 0) means "no ceiling" — 0 is a real, meaningful
+	// value here ("hold before spending anything"), so a NOT NULL DEFAULT 0 would
+	// silently arm a ceiling on all 4100 existing rows. The partial index is the
+	// curator's scan: the items with a ceiling are a tiny slice of the table.
+	db.Exec(`ALTER TABLE items ADD COLUMN auto_hold_at_usd REAL`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_items_spend_ceiling ON items(id) WHERE auto_hold_at_usd IS NOT NULL`); err != nil {
+		return fmt.Errorf("items.auto_hold_at_usd missing (ALTER failed and this is not a re-run): %w", err)
+	}
+
 	// Prior state of every item, snapshotted before each mutation. Nothing in
 	// this store destroys data: DELETE sets deleted_at, and an UPDATE that
 	// overwrites a body leaves the old one here. A `workspace` is rewritten on
@@ -186,13 +195,16 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var scheduleJSON sql.NullString
 	var heldAt sql.NullTime
 	var holdReason sql.NullString
+	// NullFloat64, not float64: NULL means "no ceiling" and 0 means "hold before
+	// spending a cent". Scanning into a plain float64 would collapse the two.
+	var autoHoldAtUSD sql.NullFloat64
 
 	err := row.Scan(
 		&item.ID, &item.Type, &item.Title, &item.Body,
 		&tagsJSON, &item.Priority, &item.Rank, &item.Status,
 		&item.ListID, &dueAt, &parentID, &linksJSON,
 		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &deletedAt,
-		&scheduleJSON, &heldAt, &holdReason,
+		&scheduleJSON, &heldAt, &holdReason, &autoHoldAtUSD,
 	)
 	if err != nil {
 		return nil, err
@@ -206,6 +218,10 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	}
 	if holdReason.Valid {
 		item.HoldReason = holdReason.String
+	}
+	if autoHoldAtUSD.Valid {
+		v := autoHoldAtUSD.Float64
+		item.AutoHoldAtUSD = &v
 	}
 	if scheduleJSON.Valid && scheduleJSON.String != "" {
 		// Unlike tags and links above, a malformed schedule is NOT swallowed. A
@@ -245,8 +261,8 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 // write set for a new row and deliberately does not: an item is never born
 // deleted, so the two lists are different sets rather than one list with a
 // NULL padded onto every INSERT.
-const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at, schedule, held_at, hold_reason"
-const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, schedule, held_at, hold_reason"
+const itemCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, deleted_at, schedule, held_at, hold_reason, auto_hold_at_usd"
+const insertCols = "id, type, title, body, tags, priority, rank, status, list_id, due_at, parent_id, links, created_by, created_at, updated_at, schedule, held_at, hold_reason, auto_hold_at_usd"
 
 // notDeleted is the standing filter on every read path. A soft delete that any
 // list still returns is not a delete.
@@ -331,13 +347,19 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 		heldAt = now
 	}
 
+	item.AutoHoldAtUSD = req.AutoHoldAtUSD
+	var autoHoldAtUSD interface{}
+	if item.AutoHoldAtUSD != nil {
+		autoHoldAtUSD = *item.AutoHoldAtUSD
+	}
+
 	_, err = s.db.Exec(
-		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		item.ID, item.Type, item.Title, item.Body,
 		string(tagsJSON), item.Priority, item.Rank, item.Status,
 		item.ListID, dueAt, item.ParentID, string(linksJSON),
 		item.CreatedBy, item.CreatedAt, item.UpdatedAt, schedule,
-		heldAt, item.HoldReason,
+		heldAt, item.HoldReason, autoHoldAtUSD,
 	)
 	if err != nil {
 		return nil, err
@@ -526,6 +548,19 @@ func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item
 		}
 		sets = append(sets, "schedule = ?")
 		args = append(args, schedule)
+	}
+
+	// Spend ceiling. Keys off HasAutoHoldAtUSD so an explicit `null` clears it.
+	if req.HasAutoHoldAtUSD {
+		if req.AutoHoldAtUSD != nil && *req.AutoHoldAtUSD < 0 {
+			return nil, fmt.Errorf("auto_hold_at_usd must not be negative (got %v)", *req.AutoHoldAtUSD)
+		}
+		sets = append(sets, "auto_hold_at_usd = ?")
+		if req.AutoHoldAtUSD == nil {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.AutoHoldAtUSD)
+		}
 	}
 
 	if len(sets) == 0 {
