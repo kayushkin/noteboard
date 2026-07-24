@@ -925,9 +925,35 @@ type SearchParams struct {
 	IncludeHeld bool
 }
 
+// ftsMatchQuery turns a raw user query into a safe FTS5 MATCH expression.
+//
+// FTS5's MATCH grammar treats a bare query string as a full query expression,
+// so characters that are operators there — a hyphen (column-filter / the "-"
+// NOT prefix), ':', '*', '(', '"', 'AND'/'OR'/'NOT' — make a plain word like
+// "hello-world" a syntax error, which surfaced as a 500 on every hyphenated
+// search. We tokenize on whitespace and wrap each token in a double-quoted FTS5
+// string literal (doubling any embedded quote to escape it). A quoted token is
+// literal text, not grammar, so punctuation inside it is harmless; joining the
+// tokens with spaces keeps the implicit-AND ("all terms must match") behavior a
+// raw multi-word query already had. An all-whitespace or empty query yields ""
+// and the caller returns no results rather than issuing an invalid MATCH.
+func ftsMatchQuery(raw string) string {
+	fields := strings.Fields(raw)
+	quoted := make([]string, 0, len(fields))
+	for _, f := range fields {
+		quoted = append(quoted, `"`+strings.ReplaceAll(f, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, " ")
+}
+
 func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
+	match := ftsMatchQuery(p.Query)
+	if match == "" {
+		return []*model.Item{}, nil
+	}
+
 	where := []string{"items.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)", notDeleted}
-	args := []interface{}{p.Query}
+	args := []interface{}{match}
 
 	if !p.IncludeHeld {
 		where = append(where, notHeld)

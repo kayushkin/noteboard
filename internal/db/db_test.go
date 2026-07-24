@@ -190,6 +190,46 @@ func TestSearchMatchesViaFTS5(t *testing.T) {
 	}
 }
 
+// TestSearchHandlesFTS5Operators covers queries that contain FTS5 operator
+// characters. A hyphen is FTS5's NOT prefix, so a raw "hello-world" MATCH is a
+// syntax error that used to bubble up as a 500 on the /api/search endpoint.
+// After sanitizing, such a query is a literal phrase: it must not error, and it
+// must still match an item whose text contains those words.
+func TestSearchHandlesFTS5Operators(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreate(t, s, "editorial-decision backlog")
+	mustCreate(t, s, "unrelated entry")
+
+	// Queries that are pure FTS5 operators or punctuation must return cleanly
+	// (no hits, no error) rather than a syntax-error 500.
+	for _, q := range []string{"a-b", "---", "*", ":", "AND", `foo"bar`, "   "} {
+		if _, err := s.Search(SearchParams{Query: q}); err != nil {
+			t.Fatalf("Search(%q) errored, want a clean empty result: %v", q, err)
+		}
+	}
+
+	// A hyphenated query must still find the item it names.
+	found, err := s.Search(SearchParams{Query: "editorial-decision"})
+	if err != nil {
+		t.Fatalf("Search(editorial-decision): %v", err)
+	}
+	if len(found) != 1 || found[0].ID != item.ID {
+		t.Fatalf("Search(editorial-decision) = %d hits, want just %q", len(found), item.Title)
+	}
+
+	// Multi-word queries keep implicit-AND semantics: both terms must match.
+	if found, err := s.Search(SearchParams{Query: "editorial backlog"}); err != nil {
+		t.Fatalf("Search(editorial backlog): %v", err)
+	} else if len(found) != 1 || found[0].ID != item.ID {
+		t.Fatalf("Search(editorial backlog) = %d hits, want just %q", len(found), item.Title)
+	}
+	if found, err := s.Search(SearchParams{Query: "editorial nonexistentword"}); err != nil {
+		t.Fatalf("Search(editorial nonexistentword): %v", err)
+	} else if len(found) != 0 {
+		t.Fatalf("Search(editorial nonexistentword) = %d hits, want 0 (implicit AND)", len(found))
+	}
+}
+
 // TestDueAtPreservesStoredOffset covers the one non-null due_at in the live
 // database, which is RFC3339 with a -07:00 offset. The offset is part of the
 // value the caller supplied, so it has to survive the round trip rather than
