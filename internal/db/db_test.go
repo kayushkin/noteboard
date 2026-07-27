@@ -173,6 +173,87 @@ func TestListOrdersChronologicallyAcrossDriverEras(t *testing.T) {
 	}
 }
 
+// insertDatedRow writes a row with a chosen priority and creation time, so a
+// test can pin an ordering without racing the clock. Sorting is the one thing
+// CreateItem cannot set up: it stamps time.Now(), and rows created inside the
+// same test can land on the same timestamp.
+func insertDatedRow(t *testing.T, s *Store, id, title string, priority int, created time.Time) {
+	t.Helper()
+	stamp := created.Format(legacyTimeLayout)
+	_, err := s.db.Exec(
+		"INSERT INTO items ("+insertCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		id, "todo", title, "", "[]", priority, 0.0, "open", "", nil, nil, "[]", "", stamp, stamp, nil,
+		nil, "", nil,
+	)
+	if err != nil {
+		t.Fatalf("insert row %q: %v", id, err)
+	}
+}
+
+// TestPrioritySortBreaksTiesByRecency pins the tiebreaker on the priority sort.
+//
+// Priority is a tiny enumeration over a big table, so nearly every row ties with
+// nearly every other: on the night this was written, 42 of the 85 open todos sat
+// at priority 0. "ORDER BY priority DESC" alone therefore leaves the order of
+// almost the whole table up to SQLite, and a caller passing a LIMIT gets an
+// arbitrary slice of the tied rows rather than a stated one. Asserting only that
+// two reads agree would not catch it — SQLite happens to scan in rowid order —
+// so this asserts the order the store actually promises: newest first within a
+// priority.
+func TestPrioritySortBreaksTiesByRecency(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().UTC().Add(-24 * time.Hour)
+	// Inserted oldest-first, so rowid order is the exact reverse of the answer.
+	insertDatedRow(t, s, "tied-old", "tied, created first", 0, base)
+	insertDatedRow(t, s, "tied-mid", "tied, created second", 0, base.Add(time.Hour))
+	insertDatedRow(t, s, "tied-new", "tied, created last", 0, base.Add(2*time.Hour))
+	insertDatedRow(t, s, "urgent", "the only high-priority row", 4, base)
+
+	items, err := s.ListItems(ListParams{Type: "todo", Sort: "priority"})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	got := make([]string, len(items))
+	for i, it := range items {
+		got[i] = it.ID
+	}
+	want := []string{"urgent", "tied-new", "tied-mid", "tied-old"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("priority sort returned %v, want %v", got, want)
+	}
+}
+
+// TestLimitedPrioritySortKeepsTheHighestPriorityRows is the reason the
+// tiebreaker matters. A limited read is how every unattended consumer sees this
+// table, and without a total order the rows it drops are whichever ones SQLite
+// felt like dropping — not the least important ones.
+func TestLimitedPrioritySortKeepsTheHighestPriorityRows(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().UTC().Add(-48 * time.Hour)
+	// The low-priority rows are the newest, so a sort that ignores priority —
+	// or one whose ties are arbitrary — buries the urgent pair.
+	insertDatedRow(t, s, "urgent-a", "urgent, oldest row in the table", 4, base)
+	insertDatedRow(t, s, "urgent-b", "urgent, second oldest", 4, base.Add(time.Minute))
+	for i := 0; i < 20; i++ {
+		insertDatedRow(t, s, fmt.Sprintf("noise-%02d", i), "recent low-priority churn", 0,
+			base.Add(time.Duration(10+i)*time.Minute))
+	}
+
+	items, err := s.ListItems(ListParams{Type: "todo", Sort: "priority", Limit: 2})
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	if items[0].ID != "urgent-b" || items[1].ID != "urgent-a" {
+		t.Errorf("limited priority sort returned %q,%q; want the two priority-4 rows newest-first",
+			items[0].ID, items[1].ID)
+	}
+}
+
 // TestSearchMatchesViaFTS5 exercises the FTS5 module at runtime. A build
 // without it never reaches this — it dies in migrate() — but the assertion also
 // covers the index and its triggers actually working.

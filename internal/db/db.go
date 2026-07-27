@@ -806,16 +806,23 @@ func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 
-	sort := "created_at DESC"
+	// Every ordering ends in a tiebreaker that no two rows can share. The
+	// columns callers sort by are full of ties — most open todos carry the same
+	// priority, and rank is 0 for everything outside a ranked list — and a bare
+	// "ORDER BY priority DESC" leaves SQLite free to return the tied rows in any
+	// order it likes. Pair that with LIMIT and two identical reads can hand back
+	// two different slices with no write in between, so a caller reading the top
+	// N never learns that the rows it did not get exist.
+	sort := "created_at DESC, id"
 	switch p.Sort {
 	case "rank":
-		sort = "rank ASC"
+		sort = "rank ASC, created_at DESC, id"
 	case "priority":
-		sort = "priority DESC"
+		sort = "priority DESC, created_at DESC, id"
 	case "updated_at":
-		sort = "updated_at DESC"
+		sort = "updated_at DESC, id"
 	case "created_at":
-		sort = "created_at DESC"
+		sort = "created_at DESC, id"
 	}
 	q += " ORDER BY " + sort
 
