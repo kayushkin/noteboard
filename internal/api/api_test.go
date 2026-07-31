@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kayushkin/noteboard/internal/api"
@@ -196,5 +197,29 @@ func TestExcludeTag(t *testing.T) {
 	// Multiple exclude_tag values are AND-combined (item must lack all of them).
 	if got := list("&exclude_tag=autoworker&exclude_tag=home"); len(got) != 0 {
 		t.Fatalf("exclude autoworker+home: expected 0 todos, got %d", len(got))
+	}
+}
+
+// TestPostingAnUnknownParentIDIsABadRequest. The caller mistyped an id; the
+// request will never succeed as written. A 500 would tell it to retry, and the
+// child it wanted would sit outside the hold and the ceiling of the tree it
+// meant to join.
+func TestPostingAnUnknownParentIDIsABadRequest(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+
+	missing := "a88bca06-3c94-4b7a-9a2d-59c2d1a3e9d1"
+	body, _ := json.Marshal(model.CreateItemRequest{
+		Type: "todo", Title: "child of nothing", ParentID: &missing,
+	})
+	req := httptest.NewRequest("POST", "/api/items", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("posting an unknown parent_id returned %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), missing) {
+		t.Errorf("the error does not name the id that was wrong: %s", w.Body.String())
 	}
 }

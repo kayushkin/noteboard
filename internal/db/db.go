@@ -364,6 +364,73 @@ const heldSubtreeCTE = `WITH RECURSIVE held_subtree(id) AS (
 		SELECT i.id FROM items i JOIN held_subtree h ON i.parent_id = h.id
 	)`
 
+// ErrUnknownParent is returned for a parent_id that names no live item, or one
+// that would put the item inside its own ancestry.
+//
+// This is not tidiness. The hold gate and the spend ceiling both roll up over
+// parent_id, and heldSubtreeCTE above does it by JOINing a child to its parent —
+// so a child whose parent_id matches no row joins to nothing and inherits
+// neither. A mistyped parent_id is a child that walks out from under the hold
+// its parent is under and out from under the dollar limit the user put on that
+// tree, and every read path then reports it as ordinary open work. There is no
+// foreign key on the column and nothing downstream can tell the difference
+// later, so the write is the only place that can refuse.
+//
+// A cycle is the same escape by another route: every item in it has a parent, so
+// none of them is reachable from outside it, and a hold placed above can never
+// arrive. The walk terminates on a cycle rather than spinning (UNION dedupes),
+// which is precisely why one would otherwise be silent.
+var ErrUnknownParent = fmt.Errorf("parent_id names no item")
+
+// checkParent rejects a parent_id that names no live item, and one whose own
+// ancestry already contains id. Walking up from the proposed parent covers the
+// self-parent case without a special case for it: id is its own first ancestor.
+//
+// A deleted parent is refused too. A tombstone cannot seed the held subtree by
+// design, so pointing a new child at one is the same hole as pointing it at
+// nothing. Rows that already point at an item deleted after the fact are left
+// alone — the delete is reversible, and the child is waiting for the restore.
+func (s *Store) checkParent(id string, parentID *string) error {
+	if parentID == nil || *parentID == "" {
+		return nil
+	}
+
+	var alive int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM items WHERE id = ? AND deleted_at IS NULL`, *parentID,
+	).Scan(&alive)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: %q", ErrUnknownParent, *parentID)
+	}
+	if err != nil {
+		return err
+	}
+
+	if id == "" {
+		return nil // a brand-new item is in nobody's ancestry yet
+	}
+
+	var cycles int
+	err = s.db.QueryRow(`
+		WITH RECURSIVE ancestors(id) AS (
+			SELECT ?
+			UNION
+			SELECT i.parent_id FROM items i
+			JOIN ancestors a ON i.id = a.id
+			WHERE i.parent_id IS NOT NULL AND i.parent_id != ''
+		)
+		SELECT 1 FROM ancestors WHERE id = ?`,
+		*parentID, id,
+	).Scan(&cycles)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %q is already below %q, and an item inside its own ancestry can never be reached by a hold placed above it", ErrUnknownParent, *parentID, id)
+}
+
 // notHeld is the standing filter on every DISCOVERY path (list, search) — the
 // paths an agent uses to find work it was not handed. It is deliberately absent
 // from GetItem: fetching by id is not discovery, and a caller holding the id has
@@ -412,6 +479,9 @@ func (s *Store) CreateItem(req *model.CreateItemRequest) (*model.Item, error) {
 		item.DueAt = req.DueAt
 	}
 	if req.ParentID != nil {
+		if err := s.checkParent("", req.ParentID); err != nil {
+			return nil, err
+		}
 		item.ParentID = req.ParentID
 	}
 	if req.Links != nil {
@@ -608,6 +678,9 @@ func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item
 		}
 	}
 	if req.ParentID != nil {
+		if err := s.checkParent(id, req.ParentID); err != nil {
+			return nil, err
+		}
 		sets = append(sets, "parent_id = ?")
 		args = append(args, *req.ParentID)
 	}

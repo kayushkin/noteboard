@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -96,6 +97,14 @@ func (a *API) items(w http.ResponseWriter, r *http.Request) {
 		}
 		item, err := a.store.CreateItem(&req)
 		if err != nil {
+			// A parent_id naming no item is the caller's mistake, not the
+			// store's failure, and it has to read as one: a 500 says "try
+			// again" about a request that will never succeed as written, and
+			// the caller keeps the id it got wrong.
+			if errors.Is(err, db.ErrUnknownParent) {
+				writeError(w, 400, err.Error())
+				return
+			}
 			writeError(w, 500, err.Error())
 			return
 		}
