@@ -28,7 +28,74 @@ import (
 // table's entire history, so rows written before and after the driver swap are
 // indistinguishable. TestTimestampsAreStoredInSQLiteFormat and
 // TestStoredTimestampsAreReadableBySQLiteDateFunctions pin both halves.
-const dsnParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_time_format=sqlite"
+//
+// journal_mode used to be in here with them and no longer is. The difference is
+// what the setting belongs to: busy_timeout and _time_format are properties of a
+// connection, so the driver is right to replay them on every one the pool opens,
+// while journal_mode is a property of the file and needs a brief exclusive lock
+// to change. Run from the DSN, that one statement lands in a place that cannot
+// retry, and reports its failure as whatever statement happened to open the
+// connection. See switchJournalMode.
+const dsnParams = "_pragma=busy_timeout(5000)&_time_format=sqlite"
+
+// busyTimeoutMilliseconds is how long a contended statement waits for a lock. It
+// is the value spelled into dsnParams above, named here so the conversion below
+// can be given the same patience rather than a second number of its own.
+const busyTimeoutMilliseconds = 5000
+
+// journalMode is the journal this database ends up in. WAL lets readers run
+// while a writer holds the file, which is the whole reason to convert at all.
+const journalMode = "WAL"
+
+// switchJournalMode moves the database file into journalMode, waiting out
+// another process converting the same fresh file.
+//
+// Switching a rollback-journal database into WAL takes a brief exclusive lock,
+// and that one statement is the only part of opening a store that busy_timeout
+// cannot mediate. Measured in memory-store, four connections racing to convert
+// one fresh file, 160 opens per row:
+//
+//	journal_mode alone              120 failed
+//	busy_timeout + journal_mode       1 failed, after 2ms
+//	busy_timeout(30000) + same        2 failed, after 1ms
+//
+// The third row is the finding: six times the timeout changes nothing and the
+// failure still lands in a millisecond, so the wait is never being entered.
+// SQLite declines to run the busy handler when a connection has to upgrade a
+// lock it already holds, because waiting there is how two connections deadlock;
+// it returns SQLITE_BUSY on the spot instead. A longer timeout has nothing to
+// give, so the wait has to be ours.
+//
+// Retrying converges because the race is only ever over the first conversion:
+// once any process has won it the file is in WAL, and every later connection
+// reads the mode back instead of changing it. This is not a retry loop around
+// ordinary reads and writes — that tries to do WAL's job by waiting, and was
+// measured worse than doing nothing. This runs once per store, on the one
+// statement that turns WAL on.
+func switchJournalMode(db *sql.DB) error {
+	deadline := time.Now().Add(busyTimeoutMilliseconds * time.Millisecond)
+
+	var settled string
+	var err error
+	for backoff := time.Millisecond; ; backoff += time.Millisecond {
+		err = db.QueryRow("PRAGMA journal_mode(" + journalMode + ")").Scan(&settled)
+		if err == nil && strings.EqualFold(settled, journalMode) {
+			return nil
+		}
+		if !time.Now().Add(backoff).Before(deadline) {
+			break
+		}
+		time.Sleep(backoff)
+	}
+
+	if err != nil {
+		return fmt.Errorf("switch journal mode to %s: %w", journalMode, err)
+	}
+	// A lost race can also come back quietly, reporting the mode it stayed on
+	// rather than an error, and a database left on the rollback journal is the
+	// serialized queue WAL exists to prevent.
+	return fmt.Errorf("journal mode settled on %q, want %s", settled, journalMode)
+}
 
 type Store struct {
 	db *sql.DB
@@ -49,6 +116,11 @@ func New(dbPath string) (*Store, error) {
 	// with WAL and a busy_timeout set, so the pool is pinned to a single
 	// connection and writes serialise in database/sql instead.
 	db.SetMaxOpenConns(1)
+
+	if err := switchJournalMode(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	if err := migrate(db); err != nil {
 		db.Close()
