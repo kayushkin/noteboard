@@ -174,11 +174,8 @@ Check `GET /api/items/{id}/occurrences?from=&to=` before trusting a rule —
 start on a Tuesday. Occurrences are capped at 500 per list, and the response
 sets `truncated` when the cap was hit.
 
-⚠️ **Known bug: `rdate` and `exdate` also move the nag.** `Schedule.expand`
-(`model/schedule.go`) applies them to whichever rule it is expanding, nag
-included, though they are documented as due-date modifiers. An item with a daily
-nag and one `rdate` nags on that extra date too. Do not set `rdate`/`exdate` on
-an item you also nag on unless you want both to move.
+`rdate` and `exdate` modify the **due** series only. They do not move the nag: an
+extra due date does not buy an extra nag, and a skipped due week still nags.
 
 ## Development
 

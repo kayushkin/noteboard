@@ -184,6 +184,67 @@ func TestNagAnchorsOnItemDueDate(t *testing.T) {
 	}
 }
 
+// RDate and ExDate describe the DUE series. Expanding the nag rule through them
+// too meant one extra due date bought one extra nag, and a skipped due week
+// silently skipped that week's nagging — neither of which the user wrote. This
+// reaches real reminders through the coordinator, not just the preview, so it is
+// pinned on both rules at once.
+func TestDueDateOverridesDoNotMoveTheNag(t *testing.T) {
+	loc := mustLoadPacific(t)
+	anchor := time.Date(2026, 8, 10, 9, 0, 0, 0, loc)
+	extra := time.Date(2026, 12, 25, 9, 0, 0, 0, loc)
+	sched := &Schedule{
+		DTStart: &anchor,
+		TZID:    "America/Los_Angeles",
+		RRule:   "FREQ=DAILY;COUNT=2",
+		RDate:   []time.Time{extra},
+		Remind:  &Remind{Nag: "FREQ=DAILY;COUNT=2"},
+	}
+	if err := sched.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	from := time.Date(2026, 8, 1, 0, 0, 0, 0, loc)
+	to := time.Date(2027, 1, 1, 0, 0, 0, 0, loc)
+
+	// The due series keeps its extra date: that is what RDate is for.
+	due, err := sched.DueOccurrences(nil, from, to)
+	if err != nil {
+		t.Fatalf("DueOccurrences: %v", err)
+	}
+	if len(due) != 3 {
+		t.Fatalf("got %d due occurrences %v, want 3 (COUNT=2 plus the RDate)", len(due), due)
+	}
+	if !due[2].Equal(extra) {
+		t.Errorf("last due occurrence = %v, want the RDate %v", due[2], extra)
+	}
+
+	// The nag rule says COUNT=2 and must fire exactly twice.
+	nag, err := sched.NagOccurrences(nil, from, to)
+	if err != nil {
+		t.Fatalf("NagOccurrences: %v", err)
+	}
+	if len(nag) != 2 {
+		t.Fatalf("got %d nag firings %v, want 2 — the due RDate leaked into the nag rule", len(nag), nag)
+	}
+	for _, occurrence := range nag {
+		if occurrence.Equal(extra) {
+			t.Errorf("nag fired on the due-only RDate %v", extra)
+		}
+	}
+
+	// Same edge from the other side: an ExDate skips a due date, not a nag.
+	sched.RDate = nil
+	sched.ExDate = []time.Time{anchor}
+	nag, err = sched.NagOccurrences(nil, from, to)
+	if err != nil {
+		t.Fatalf("NagOccurrences: %v", err)
+	}
+	if len(nag) != 2 {
+		t.Fatalf("got %d nag firings %v after an ExDate, want 2 — the due ExDate suppressed a nag", len(nag), nag)
+	}
+}
+
 // A finite series has to actually end, otherwise a rolling item never retires.
 func TestSeriesEndsAndNextOccurrenceGoesNil(t *testing.T) {
 	loc := mustLoadPacific(t)

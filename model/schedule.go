@@ -54,9 +54,14 @@ type Schedule struct {
 
 	// RDate adds explicit one-off occurrences on top of RRule. An item with only
 	// RDate and no RRule is "these specific dates and no others".
+	//
+	// Applies to the DUE series only, never to Remind.Nag. Both used to be fed
+	// into whichever rule was being expanded, so adding one extra due date also
+	// bought an extra nag on that date — a rule the user never wrote.
 	RDate []time.Time `json:"rdate,omitempty"`
 
-	// ExDate removes occurrences the rule would otherwise produce (a skipped week).
+	// ExDate removes occurrences the rule would otherwise produce (a skipped
+	// week). Due series only, on the same grounds as RDate.
 	ExDate []time.Time `json:"exdate,omitempty"`
 
 	// Mode decides what an occurrence MEANS. See ScheduleMode* below.
@@ -256,19 +261,26 @@ func (s *Schedule) DueOccurrences(dueAt *time.Time, from, to time.Time) ([]time.
 	if !s.HasDueRecurrence() {
 		return nil, nil
 	}
-	return s.expand(s.RRule, dueAt, from, to)
+	return s.expand(s.RRule, s.RDate, s.ExDate, dueAt, from, to)
 }
 
 // NagOccurrences expands the nag rule — the instants an unfinished item should
 // bother the user, independent of when it is due.
+//
+// RDate and ExDate are deliberately NOT passed: they describe the due series,
+// and feeding them to the nag rule made one extra due date fire one extra nag.
 func (s *Schedule) NagOccurrences(dueAt *time.Time, from, to time.Time) ([]time.Time, error) {
 	if s.Remind.nagRule() == "" {
 		return nil, nil
 	}
-	return s.expand(s.Remind.Nag, dueAt, from, to)
+	return s.expand(s.Remind.Nag, nil, nil, dueAt, from, to)
 }
 
-func (s *Schedule) expand(rule string, dueAt *time.Time, from, to time.Time) ([]time.Time, error) {
+// expand turns one rule into the instants it produces in [from, to]. The RDATE
+// and EXDATE sets are parameters rather than reads off s, so each caller states
+// which series the dates belong to instead of every rule silently inheriting
+// them.
+func (s *Schedule) expand(rule string, rdate, exdate []time.Time, dueAt *time.Time, from, to time.Time) ([]time.Time, error) {
 	loc, err := s.Location()
 	if err != nil {
 		return nil, err
@@ -293,10 +305,10 @@ func (s *Schedule) expand(rule string, dueAt *time.Time, from, to time.Time) ([]
 		}
 		set.RRule(r)
 	}
-	for _, d := range s.RDate {
+	for _, d := range rdate {
 		set.RDate(d.In(loc))
 	}
-	for _, d := range s.ExDate {
+	for _, d := range exdate {
 		set.ExDate(d.In(loc))
 	}
 
