@@ -2,9 +2,14 @@
 # Boot-and-answer smoke test for noteboard.
 #
 # Builds the server from THIS checkout, boots it against a throwaway SQLite
-# database on a throwaway port, and drives every registered route through a
-# real create → read → search → rerank → update → archive lifecycle. The live
-# service (:8191, ~/.noteboard/noteboard.db) is never touched.
+# database on a throwaway port, and drives a real create → read → search →
+# rerank → update → delete → restore lifecycle over HTTP. The live service
+# (:8191, ~/.noteboard/noteboard.db) is never touched.
+#
+# It covers /health, /api/items (GET, POST), /api/items/{id} (GET, PATCH,
+# DELETE), /api/items/{id}/restore, /api/items/{id}/revisions,
+# /api/items/rerank, /api/tags and /api/search. It does NOT yet cover
+# /api/items/{id}/hold, /unhold, /occurrences or /api/lists.
 #
 # Why this exists: `go build` passing proves nothing about whether the binary
 # can BOOT. Two failure classes here are invisible to the compiler:

@@ -56,7 +56,14 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
-	count, _ := a.store.ItemCount()
+	// Report a broken database as unhealthy. Swallowing this error answered
+	// {"status":"ok","items":0} when the store could not be read at all, which
+	// is the one answer a health check must never give.
+	count, err := a.store.ItemCount()
+	if err != nil {
+		writeJSON(w, 500, map[string]interface{}{"status": "error", "error": err.Error()})
+		return
+	}
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "items": count})
 }
 
@@ -338,15 +345,12 @@ func (a *API) lists(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, lists)
-	case "POST":
-		var req struct {
-			ListID string `json:"list_id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ListID == "" {
-			writeError(w, 400, "list_id is required")
-			return
-		}
-		writeJSON(w, 201, map[string]string{"list_id": req.ListID, "status": "created"})
+	// There is deliberately no POST. A list is not a stored row — ListLists
+	// derives the set by grouping items on list_id, so a list exists exactly
+	// when an item claims it and cannot be created ahead of one. The POST that
+	// used to sit here answered 201 "created" and wrote nothing, so a caller was
+	// told its list existed and then could not find it in GET /api/lists. Assign
+	// list_id on an item instead.
 	default:
 		writeError(w, 405, "method not allowed")
 	}

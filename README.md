@@ -1,30 +1,197 @@
-# Noteboard
+# noteboard
 
-Unified notes, todos, and ranking lists. API-first, agent-friendly.
+One store for notes, todos and ranked lists. API-first, built to be written to
+by programs rather than by a person in a text field.
 
-## Stack
-- Go + SQLite (`modernc.org/sqlite` — pure Go, no cgo, FTS5 built in)
-- REST API
-- Markdown bodies, JSON tags
+Every record is an **item**. A `type` of `note`, `todo`, `rank` or `workspace`
+says what it is; everything else — markdown body, tags, priority, due date,
+recurrence rule, parent — is the same set of columns regardless. That is the
+whole design: one table, one API, so a todo can be searched alongside a note and
+a program never has to pick which store to talk to.
 
-## Build & deploy
+Nothing here destroys data by accident. `DELETE` is reversible, every write
+snapshots the row it replaced, and a purge snapshots before it purges.
+
+## Requirements
+
+Go 1.24+. Nothing else — the SQLite driver is [`modernc.org/sqlite`][sqlite],
+which is pure Go, so `CGO_ENABLED=0` builds a static binary with FTS5 built in.
+
+[sqlite]: https://modernc.org/sqlite
+
+## Running it
+
 ```sh
-make build          # default flags, CGO_ENABLED=0
-make test
-./scripts/e2e-smoke.sh   # boots the binary on a throwaway DB and drives every route
-./deploy.sh              # build → test → smoke → install → restart → verify live
+make build
+./bin/noteboard
 ```
-`deploy.sh` installs `deploy/noteboard.service` (a `--user` unit, no sudo) and
-reads the binary path, port and database path back out of it, so there is no
-second copy of those values to drift.
 
-## API
-- `GET /api/items` — list (filter by type, tag, status, created_by)
-- `POST /api/items` — create
-- `PATCH /api/items/:id` — update
-- `DELETE /api/items/:id` — archive
-- `POST /api/items/rerank` — reorder items in a list
-- `GET /api/lists` — named lists
-- `GET /api/tags` — all unique tags
-- `GET /api/search?q=` — full-text search
-- `GET /health` — health check
+| Variable | Default | Meaning |
+|---|---|---|
+| `NOTEBOARD_PORT` | `8191` | Port to listen on |
+| `NOTEBOARD_DB` | `$HOME/.noteboard/noteboard.db` | SQLite file; schema and migrations run on open |
+
+`deploy/noteboard.service` is a `--user` unit. `deploy.sh` reads the binary path,
+port and database path back *out of* that unit rather than restating them, then
+builds, tests, smokes on a throwaway database, installs, restarts and verifies.
+
+⚠️ **`deploy.sh` will not complete a first-ever deploy against an empty
+database.** It asserts `/health` reports more than zero items, which exists to
+catch a binary that silently opened the wrong database file. On a fresh install
+that assertion is a false alarm. Create an item first, or drop that check.
+
+## Security
+
+**There is no authentication and no authorization.** Every endpoint is open to
+anyone who can reach the port, and `Access-Control-Allow-Origin` is `*`
+(`internal/api/api.go:37`), so any web page in any browser that can route to the
+host can read and rewrite the whole store. The server binds every interface, not
+loopback (`cmd/noteboard/main.go:35`), and there is no option to change that —
+`NOTEBOARD_PORT` sets the port only.
+
+`created_by` is a caller-supplied string used as a list filter. **It is not an
+identity and nothing checks it.**
+
+There is also no request body size limit, no rate limiting, and no read/write
+timeouts on the HTTP server.
+
+This is a deliberate fit for one trusted host behind a firewall. It is **unsafe
+on any network you do not control**. Put it behind a reverse proxy that
+authenticates, or bind it to loopback, before it can be routed to.
+
+## HTTP API
+
+All bodies are JSON. `OPTIONS` on any path returns `204`.
+
+### Items
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/items` | See filters below |
+| `POST` | `/api/items` | `type` and `title` required → `201` |
+| `GET` | `/api/items/{id}` | `?include_deleted=true` to fetch a tombstone |
+| `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below |
+| `DELETE` | `/api/items/{id}` | Reversible; `?hard=true` purges |
+| `POST` | `/api/items/{id}/restore` | Undo a delete |
+| `GET` | `/api/items/{id}/revisions` | Every prior state, newest first |
+| `POST` | `/api/items/{id}/hold` | Optional `{"reason":…}` |
+| `POST` | `/api/items/{id}/unhold` | |
+| `GET` | `/api/items/{id}/occurrences` | `?from=&to=` RFC3339; `400` if the item has no schedule |
+| `POST` | `/api/items/rerank` | `{"items":[{"id":…,"rank":…}]}` |
+
+**List filters** on `GET /api/items`: `type`, `tag`, `exclude_tag` (repeatable),
+`status`, `list_id`, `created_by`, `parent_id`, `include_deleted`,
+`include_held`, `limit` (default 100), `offset`, and `sort` — one of `rank`,
+`priority`, `updated_at`, `created_at` (default `created_at` descending).
+
+**Nullable fields on `PATCH`** — `tags`, `links`, `due_at`, `schedule` and
+`auto_hold_at_usd` track presence, so an explicit `null` clears the field and
+leaving it out means "don't touch". Absent and null are different requests.
+
+### Discovery
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/lists` | `list_id` values with their counts |
+| `GET` | `/api/tags` | Every unique tag with its count, most-used first |
+| `GET` | `/api/search?q=` | FTS5 over title and body; `&type=`, `&tag=`, `&status=`, `&limit=` (default 50), `&include_held=` |
+| `GET` | `/health` | `{"status":"ok","items":N}`; **500** if the database cannot be read |
+
+A **list is not a stored row.** `GET /api/lists` derives the set by grouping
+items on `list_id`, so a list exists exactly when an item claims it. There is no
+`POST /api/lists` — assign `list_id` on an item instead.
+
+## Behaviors worth knowing before you build on it
+
+**Delete is reversible and is not archiving.** `DELETE` stamps `deleted_at` and
+leaves the row in place; it drops out of every read path — list, get, search,
+tags, lists, count — and `POST /api/items/{id}/restore` brings it back in
+exactly the state it left in. It deliberately does **not** touch `status`:
+archived is a state you chose for a live item, deletion is the item being taken
+away, and collapsing the two means a restore cannot tell them apart. `?hard=true`
+purges the row, and snapshots it into revisions before doing so.
+
+**Revisions are partial.** Every update, delete, restore, hold and unhold writes
+a snapshot, but the snapshot covers 8 columns — `title`, `body`, `tags`,
+`status`, `priority`, `list_id`, `parent_id`, `links`. It does **not** cover
+`rank`, `due_at` or `schedule`, and `POST /api/items/rerank` writes `rank` with
+no snapshot at all. Overwrite a recurrence rule and the old rule is gone. Read
+before you overwrite.
+
+**Held items are hidden by default, and nothing in the response says so.** A
+hold is the user parking work behind a gate: the item stays `open` and stays
+visible to a human, but `GET /api/items` and `/api/search` withhold it unless
+you pass `include_held=true`. Hold is inherited down `parent_id`, so holding a
+parent withholds its whole subtree. An unattended worker should leave that
+default alone rather than widening its own search with it.
+
+Hold is deliberately not a `status`. Status is the work's lifecycle; hold is who
+is allowed to act on it, and an item can legitimately be both open and held.
+
+**`parent_id` is validated on write.** A parent that names no live item, names a
+tombstone, or would close a cycle is refused with `400`. Both the hold gate and
+the `auto_hold_at_usd` spend ceiling roll up over that edge, so a dangling
+parent would let a child escape an inherited hold.
+
+**`auto_hold_at_usd` is a pointer for a reason.** `null` means no ceiling; `0` is
+a real ceiling meaning "hold before spending anything". A plain number would make
+those two the same request. The dollars actually spent are not stored on the
+item.
+
+**`workspace` is its own type**, not a tagged note: an agent's durable working
+memory, rewritten every run. It is a type so it can never be mistaken for work
+to do, and so the schema can enforce one per job.
+
+### Recurrence
+
+Any item can carry a `schedule` — an RFC 5545 rule for when it falls due and
+when it nudges. `due_at` stays the single source of truth for when the item is
+next due; the schedule is the rule that *generates* that answer, and `dtstart`
+is the series anchor, not the current due date.
+
+```json
+{
+  "dtstart": "2026-07-21T09:00:00-07:00",
+  "tzid": "America/Los_Angeles",
+  "rrule": "FREQ=MONTHLY;BYDAY=3TU",
+  "mode": "instance",
+  "remind": {"lead": ["-P1D"], "channels": ["digest"]}
+}
+```
+
+- **`tzid` is mandatory whenever a rule is present and is never defaulted.** An
+  offset is not a zone: a rule anchored to `-07:00` cannot know what happens at
+  a DST transition and silently drifts an hour twice a year.
+- **`mode`** — `instance` (default) materializes each occurrence as a child item,
+  so a consumer sees ordinary todos and never has to understand recurrence.
+  `rolling` keeps one row whose `due_at` advances on completion, with no history.
+- **`remind.lead`** takes ISO-8601 offsets before due (`-P1D`), calendar-aware.
+- **`remind.nag`** is a second rule that repeats until the item is done.
+- An invalid rule is rejected at write time rather than expanding to nothing.
+
+Check `GET /api/items/{id}/occurrences?from=&to=` before trusting a rule —
+`BYDAY=3TU` and `BYDAY=TU;BYSETPOS=3` read alike and diverge in months that
+start on a Tuesday. Occurrences are capped at 500 per list, and the response
+sets `truncated` when the cap was hit.
+
+⚠️ **Known bug: `rdate` and `exdate` also move the nag.** `Schedule.expand`
+(`model/schedule.go`) applies them to whichever rule it is expanding, nag
+included, though they are documented as due-date modifiers. An item with a daily
+nag and one `rdate` nags on that extra date too. Do not set `rdate`/`exdate` on
+an item you also nag on unless you want both to move.
+
+## Development
+
+```sh
+make vet
+make test
+./scripts/e2e-smoke.sh   # boots the real binary on a throwaway DB and drives it over HTTP
+```
+
+The smoke test is what catches the failures the compiler cannot: a build without
+FTS5 compiles green and fails at `CREATE VIRTUAL TABLE`, and a Go 1.22+
+`ServeMux` route conflict compiles green and panics at boot.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
