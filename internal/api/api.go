@@ -201,6 +201,17 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 		// ?hard=true purges, and even that snapshots into item_revisions first.
 		hard := r.URL.Query().Get("hard") == "true"
 		if err := a.store.DeleteItem(id, hard); err != nil {
+			// An id that names no row is the caller's mistake, and it reads as
+			// one here for the same reason it does on create: a 500 says "try
+			// again" about a request that will never succeed as written. Every
+			// other missing-item route on this service already answers 404, so
+			// delete reporting 500 also made the store look like it fails on
+			// one verb and not the others. Anything that is not a missing row
+			// is still a server fault and still says so.
+			if errors.Is(err, db.ErrItemNotFound) {
+				writeError(w, 404, "not found")
+				return
+			}
 			writeError(w, 500, err.Error())
 			return
 		}

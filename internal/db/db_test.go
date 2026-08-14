@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -878,5 +879,53 @@ func TestNoLimitStillMeansTheWholeHistory(t *testing.T) {
 	}
 	if len(all) != 5 {
 		t.Fatalf("unpaged read returned %d revisions, want all 5", len(all))
+	}
+}
+
+// TestAMissingRowIsReportedAsErrItemNotFound. Every single-item read goes
+// through scanItem, so the condition is born in one place and every caller can
+// recognise it with errors.Is. Before this, the only signal was the driver's
+// sql.ErrNoRows, which a handler can match on only by importing database/sql to
+// ask a question about its own store.
+func TestAMissingRowIsReportedAsErrItemNotFound(t *testing.T) {
+	s := newTestStore(t)
+	missing := "a88bca06-3c94-4b7a-9a2d-59c2d1a3e9d1"
+
+	reads := map[string]func(string) (*model.Item, error){
+		"GetItem":                 s.GetItem,
+		"GetItemIncludingDeleted": s.GetItemIncludingDeleted,
+	}
+	for name, read := range reads {
+		_, err := read(missing)
+		if !errors.Is(err, ErrItemNotFound) {
+			t.Errorf("%s on a missing id returned %v, want ErrItemNotFound", name, err)
+		}
+	}
+
+	if err := s.DeleteItem(missing, false); !errors.Is(err, ErrItemNotFound) {
+		t.Errorf("DeleteItem on a missing id returned %v, want ErrItemNotFound", err)
+	}
+}
+
+// TestASoftDeletedRowIsStillFound is the boundary the sentinel must not cross.
+// GetItem hides a tombstone and so reports it missing; GetItemIncludingDeleted
+// is the read that still has to find it, and DeleteItem is built on that one.
+// If both reads reported ErrItemNotFound, a second delete would answer 404 for
+// an item whose row is right there.
+func TestASoftDeletedRowIsStillFound(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeNote, "tombstoned", "body")
+	if err := s.DeleteItem(item.ID, false); err != nil {
+		t.Fatalf("DeleteItem: %v", err)
+	}
+
+	if _, err := s.GetItem(item.ID); !errors.Is(err, ErrItemNotFound) {
+		t.Errorf("GetItem on a tombstone returned %v, want ErrItemNotFound", err)
+	}
+	if _, err := s.GetItemIncludingDeleted(item.ID); err != nil {
+		t.Errorf("GetItemIncludingDeleted lost a tombstoned row: %v", err)
+	}
+	if err := s.DeleteItem(item.ID, false); err != nil {
+		t.Errorf("a second soft delete reported %v; it is a no-op, not a missing item", err)
 	}
 }

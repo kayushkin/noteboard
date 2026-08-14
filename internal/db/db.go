@@ -254,6 +254,19 @@ func migrate(db *sql.DB) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// ErrItemNotFound reports that an id names no row. Every read of a single item
+// goes through scanItem, so this is the one place the condition is born and the
+// one error every caller has to recognise — the driver's own sql.ErrNoRows says
+// "a query returned nothing", which is true of a great many failures that are
+// not the caller naming a row that isn't there.
+//
+// It exists so a handler can tell the caller's mistake from the store's failure.
+// Without it the only signal is sql.ErrNoRows, and a handler that wants to
+// answer 404 for a missing item has to either match on the driver's error or
+// collapse every error to 404 — the second reports "not found" for an item that
+// is plainly there, which is the same hole ErrUnknownParent was added to close.
+var ErrItemNotFound = fmt.Errorf("no such item")
+
 func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var item model.Item
 	var tagsJSON, linksJSON string
@@ -278,6 +291,9 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &deletedAt,
 		&scheduleJSON, &heldAt, &holdReason, &autoHoldAtUSD,
 	)
+	if err == sql.ErrNoRows {
+		return nil, ErrItemNotFound
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,18 +15,29 @@ import (
 	"github.com/kayushkin/noteboard/internal/api"
 	"github.com/kayushkin/noteboard/internal/db"
 	"github.com/kayushkin/noteboard/model"
+	_ "modernc.org/sqlite"
 )
 
 func setup(t *testing.T) (*api.API, func()) {
 	t.Helper()
+	a, _, cleanup := setupWithPath(t)
+	return a, cleanup
+}
+
+// setupWithPath also hands back the database file, for the one test that has to
+// break the store from underneath to produce a failure that is not a missing
+// row.
+func setupWithPath(t *testing.T) (*api.API, string, func()) {
+	t.Helper()
 	dir := t.TempDir()
-	store, err := db.New(filepath.Join(dir, "test.db"))
+	path := filepath.Join(dir, "test.db")
+	store, err := db.New(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = os.MkdirAll(dir, 0755)
 	a := api.New(store)
-	return a, func() { store.Close() }
+	return a, path, func() { store.Close() }
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -321,5 +333,153 @@ func TestAnUnusableLimitIsRefusedRatherThanTreatedAsUnlimited(t *testing.T) {
 		if w.Code != 400 {
 			t.Fatalf("GET /revisions%s = %d, want 400 (body %s)", q, w.Code, strings.TrimSpace(w.Body.String()))
 		}
+	}
+}
+
+// TestDeletingAnUnknownIDIsNotFound. Delete was the only missing-item route on
+// this service that answered 500, and it leaked the driver's message doing it.
+// A 500 tells the caller to retry a request that will never succeed as written,
+// and it says the store failed when what actually happened is that the caller
+// named a row that is not there.
+func TestDeletingAnUnknownIDIsNotFound(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+
+	req := httptest.NewRequest("DELETE", "/api/items/a88bca06-3c94-4b7a-9a2d-59c2d1a3e9d1", nil)
+	w := httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, req)
+
+	if w.Code != 404 {
+		t.Fatalf("deleting an unknown id returned %d, want 404: %s", w.Code, w.Body.String())
+	}
+	// The driver's message is not the caller's business, and it was the whole
+	// of the old response body.
+	if strings.Contains(w.Body.String(), "sql:") {
+		t.Errorf("the response leaks the driver's error: %s", w.Body.String())
+	}
+}
+
+// TestDeletingAnAlreadyPurgedIDIsNotFound pins the path that actually reaches
+// the missing-row branch on an id the caller once held legitimately. A soft
+// delete leaves the row, so it does NOT reach it (see the test below); a hard
+// purge takes the row away, and every delete after that names nothing.
+func TestDeletingAnAlreadyPurgedIDIsNotFound(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+
+	body, _ := json.Marshal(model.CreateItemRequest{Type: "todo", Title: "purge me"})
+	req := httptest.NewRequest("POST", "/api/items", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var item model.Item
+	json.NewDecoder(w.Body).Decode(&item)
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("DELETE", "/api/items/"+item.ID+"?hard=true", nil))
+	if w.Code != 200 {
+		t.Fatalf("purge returned %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("DELETE", "/api/items/"+item.ID, nil))
+	if w.Code != 404 {
+		t.Fatalf("deleting a purged id returned %d, want 404: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDeletingATombstonedItemAgainStaysOK. A second soft delete is a no-op, not
+// a missing item: the first stamps deleted_at and leaves the row, so the store
+// still finds it and declines to move the tombstone's timestamp. This is the
+// direction assertion for the two tests above — 404 must mean "no such row",
+// not "this item is deleted", or a repeated delete would start reporting a
+// failure for work that succeeded.
+func TestDeletingATombstonedItemAgainStaysOK(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+
+	body, _ := json.Marshal(model.CreateItemRequest{Type: "todo", Title: "delete me twice"})
+	req := httptest.NewRequest("POST", "/api/items", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var item model.Item
+	json.NewDecoder(w.Body).Decode(&item)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("DELETE", "/api/items/"+item.ID, nil))
+		if w.Code != 200 {
+			t.Fatalf("delete attempt %d returned %d, want 200: %s", attempt, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestEveryMissingItemRouteAnswersNotFound is the claim delete was the sole
+// exception to. Asserting it over the whole set rather than on delete alone is
+// what makes a future route that forgets it visible here.
+func TestEveryMissingItemRouteAnswersNotFound(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+
+	missing := "a88bca06-3c94-4b7a-9a2d-59c2d1a3e9d1"
+	routes := []struct{ method, path string }{
+		{"GET", "/api/items/" + missing},
+		{"DELETE", "/api/items/" + missing},
+		{"POST", "/api/items/" + missing + "/restore"},
+		{"POST", "/api/items/" + missing + "/hold"},
+		{"POST", "/api/items/" + missing + "/unhold"},
+		{"GET", "/api/items/" + missing + "/occurrences"},
+	}
+	for _, route := range routes {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(route.method, route.path, nil))
+		if w.Code != 404 {
+			t.Errorf("%s %s returned %d, want 404: %s", route.method, route.path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestADeleteThatFailsForAnyOtherReasonIsStillAServerError is the direction
+// assertion for the 404 above, and it is the one case the missing-row tests
+// cannot make. Mapping every delete error to 404 passes all of them, and it
+// would tell a caller "no such item" about an item that is plainly there —
+// exactly what the PATCH handler already refuses to do.
+//
+// The failure is induced by taking away the table the snapshot writes to, so
+// DeleteItem fails after it has already found the row.
+func TestADeleteThatFailsForAnyOtherReasonIsStillAServerError(t *testing.T) {
+	a, path, cleanup := setupWithPath(t)
+	defer cleanup()
+	h := a.Handler()
+
+	body, _ := json.Marshal(model.CreateItemRequest{Type: "todo", Title: "present and correct"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/api/items", bytes.NewReader(body)))
+	var item model.Item
+	json.NewDecoder(w.Body).Decode(&item)
+
+	sabotage, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sabotage.Exec("DROP TABLE item_revisions"); err != nil {
+		t.Fatal(err)
+	}
+	sabotage.Close()
+
+	// The row is still there, so this is not a missing item by any reading.
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/items/"+item.ID, nil))
+	if w.Code != 200 {
+		t.Fatalf("the item under test is not readable, so the delete below proves nothing: %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("DELETE", "/api/items/"+item.ID, nil))
+	if w.Code != 500 {
+		t.Fatalf("a delete that failed for a reason other than a missing row returned %d, want 500: %s",
+			w.Code, w.Body.String())
 	}
 }
