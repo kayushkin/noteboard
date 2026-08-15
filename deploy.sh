@@ -68,6 +68,27 @@ make test
 STAGED="$REPO_DIR/bin/noteboard"
 make build
 [ -x "$STAGED" ] || fail "make build produced no binary at $STAGED"
+
+# Checked BEFORE the install, for the same reason the smokes are: an unidentifiable
+# binary compiles perfectly and reads clean in the log, so installing first would put
+# it in front of live sessions and only then tell us it cannot be traced to a commit.
+echo "==> Checking provenance..."
+buildinfo="$(go version -m "$STAGED")"
+vcs_revision="$(printf '%s\n' "$buildinfo" | awk -F= '$1 ~ /[[:space:]]vcs\.revision$/ {{print $2}}')"
+vcs_modified="$(printf '%s\n' "$buildinfo" | awk -F= '$1 ~ /[[:space:]]vcs\.modified$/ {{print $2}}')"
+if [ -z "$vcs_revision" ]; then
+    echo "    'go build' writes no VCS stamp when it cannot find a .git DIRECTORY, and it does" >&2
+    echo "    not fail when that happens -- not even with -buildvcs=true. The usual cause is" >&2
+    echo "    building from a git worktree, whose .git is a pointer file. Build from a real" >&2
+    echo "    clone or checkout instead." >&2
+    fail "refusing to install "$STAGED": no vcs.revision, so nothing ties it back to a commit"
+fi
+echo "    vcs.revision=$vcs_revision"
+if [ "$vcs_modified" = "true" ]; then
+    echo "    WARNING: built from a DIRTY tree (vcs.modified=true). $vcs_revision names the" >&2
+    echo "    commit this binary was built NEAR, not the source it was built FROM, and that" >&2
+    echo "    source is not recoverable from any commit. Commit first for a reproducible build." >&2
+fi
 echo "    built: $(ls -lh "$STAGED" | awk '{print $5}')"
 
 step "boot-and-answer smoke on a throwaway DB, before touching the live one"
