@@ -103,7 +103,12 @@ type Revision struct {
 	Links     []string   `json:"links"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 	// Reason names the mutation that produced this snapshot: update, delete,
-	// or restore.
+	// purge, restore, hold or unhold.
+	//
+	// delete and purge are the two that must not be read as one. A delete
+	// leaves the row and can be undone; a purge is the only mutation in this
+	// store that destroys it, so its snapshot is the sole surviving copy of
+	// the item and this column is the only thing that says so.
 	Reason     string    `json:"reason"`
 	ReplacedAt time.Time `json:"replaced_at"`
 }
