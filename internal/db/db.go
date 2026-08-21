@@ -579,11 +579,37 @@ func (s *Store) snapshot(item *model.Item, reason string) error {
 	return err
 }
 
-// ListRevisions returns an item's prior states, newest first.
-func (s *Store) ListRevisions(itemID string) ([]*model.Revision, error) {
-	rows, err := s.db.Query(
-		`SELECT id, item_id, title, body, tags, status, priority, list_id, parent_id, links, deleted_at, reason, replaced_at
-		   FROM item_revisions WHERE item_id = ? ORDER BY id DESC`, itemID)
+// ListRevisions returns a page of an item's prior states, newest first.
+//
+// limit <= 0 means every revision, which is what this call did before it could
+// be paged and stays the default so no existing caller changes. That default is
+// not cheap: a revision carries the WHOLE body it replaced, so the history of a
+// long-lived item is the sum of every version of it. Measured 2026-08-21 on the
+// nightly signpost todo, 308 revisions: 246 MB from one GET. An item that is
+// rewritten on a schedule — the workspace type exists to be — grows this way by
+// construction, and the workspace contract scheduler injects into every agent
+// job's prompt points at exactly this call as the reason rewriting is safe.
+//
+// So a caller that only wants to see the last few states has to be able to say
+// so. offset pages backwards through the rest. The ordering is by revision id,
+// which is unique per row, so a page boundary cannot repeat or skip a revision
+// the way an ordering full of ties can.
+func (s *Store) ListRevisions(itemID string, limit, offset int) ([]*model.Revision, error) {
+	q := `SELECT id, item_id, title, body, tags, status, priority, list_id, parent_id, links, deleted_at, reason, replaced_at
+		   FROM item_revisions WHERE item_id = ? ORDER BY id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	} else if offset > 0 {
+		// SQLite will not take OFFSET without LIMIT, and -1 is its own spelling
+		// of "no limit". Without this an offset asked for on its own would be
+		// dropped silently and the caller would be handed page one again.
+		q += " LIMIT -1"
+	}
+	if offset > 0 {
+		q += fmt.Sprintf(" OFFSET %d", offset)
+	}
+
+	rows, err := s.db.Query(q, itemID)
 	if err != nil {
 		return nil, err
 	}

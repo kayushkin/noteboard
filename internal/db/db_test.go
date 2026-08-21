@@ -444,7 +444,7 @@ func TestUpdateSnapshotsPriorBody(t *testing.T) {
 		t.Fatalf("UpdateItem: %v", err)
 	}
 
-	revisions, err := s.ListRevisions(item.ID)
+	revisions, err := s.ListRevisions(item.ID, 0, 0)
 	if err != nil {
 		t.Fatalf("ListRevisions: %v", err)
 	}
@@ -760,5 +760,123 @@ func TestHoldInheritanceSurvivesAParentCycle(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("both items in the cycle should be withheld, got %d", len(items))
+	}
+}
+
+// The revision history is the one read on this store whose cost grows without
+// bound as an item is used normally: every snapshot carries the WHOLE body it
+// replaced, so an item that is rewritten on a schedule accumulates the sum of
+// every version of itself. Measured 2026-08-21 on the nightly signpost todo —
+// 308 revisions, 246 MB from a single GET — which is more than any caller can
+// hold and far more than one asking "what did this look like last night" wants.
+//
+// The three tests below pin the page. They matter together: a limit that is
+// silently ignored and a limit that works look identical on a short history,
+// and the histories that need paging are exactly the ones no test creates.
+func TestRevisionsCanBeAskedForOnePageAtATime(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeWorkspace, "harness-watch memory", "version 0")
+	for i := 1; i <= 5; i++ {
+		body := fmt.Sprintf("version %d", i)
+		if _, err := s.UpdateItem(item.ID, &model.UpdateItemRequest{Body: &body}); err != nil {
+			t.Fatalf("UpdateItem %d: %v", i, err)
+		}
+	}
+
+	// Newest first, so the newest snapshot holds the body the LAST update
+	// replaced — "version 4", not "version 5", which is the body still live on
+	// the item and was never replaced by anything.
+	page, err := s.ListRevisions(item.ID, 2, 0)
+	if err != nil {
+		t.Fatalf("ListRevisions: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("want a page of 2, got %d", len(page))
+	}
+	if page[0].Body != "version 4" || page[1].Body != "version 3" {
+		t.Fatalf("first page = %q, %q; want version 4, version 3", page[0].Body, page[1].Body)
+	}
+}
+
+func TestAnOffsetPagesThroughTheRestOfTheHistory(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeWorkspace, "harness-watch memory", "version 0")
+	for i := 1; i <= 5; i++ {
+		body := fmt.Sprintf("version %d", i)
+		if _, err := s.UpdateItem(item.ID, &model.UpdateItemRequest{Body: &body}); err != nil {
+			t.Fatalf("UpdateItem %d: %v", i, err)
+		}
+	}
+
+	// Walk the whole history two at a time and require it to arrive exactly
+	// once, in order. This is the assertion that a page boundary neither
+	// repeats nor skips a revision — the failure an ordering full of ties
+	// produces, and the reason this one orders by the unique revision id.
+	// The walk is bounded and the bound FAILS rather than breaks. An offset that
+	// is dropped hands back page one every time, so an unbounded loop over a
+	// paged read does not report the defect — it hangs, which reads as a slow
+	// test rather than a broken one. Found by sabotage: deleting the OFFSET
+	// clause wedged this test for two minutes instead of failing it.
+	var walked []string
+	for offset := 0; offset <= 5+2; offset += 2 {
+		page, err := s.ListRevisions(item.ID, 2, offset)
+		if err != nil {
+			t.Fatalf("ListRevisions offset %d: %v", offset, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, rev := range page {
+			walked = append(walked, rev.Body)
+		}
+	}
+	if len(walked) > 5 {
+		t.Fatalf("paging returned %d revisions for a 5-revision history — the offset is not being applied: %v", len(walked), walked)
+	}
+
+	want := []string{"version 4", "version 3", "version 2", "version 1", "version 0"}
+	if len(walked) != len(want) {
+		t.Fatalf("paging walked %d revisions, want %d: %v", len(walked), len(want), walked)
+	}
+	for i := range want {
+		if walked[i] != want[i] {
+			t.Fatalf("paged history[%d] = %q, want %q (full walk: %v)", i, walked[i], want[i], walked)
+		}
+	}
+
+	// An offset asked for on its own must still skip. SQLite refuses OFFSET
+	// without LIMIT, so the store spells the missing limit as LIMIT -1; if that
+	// is ever dropped, this call quietly returns page one again and a caller
+	// paging without a limit loops forever on the same rows.
+	rest, err := s.ListRevisions(item.ID, 0, 3)
+	if err != nil {
+		t.Fatalf("ListRevisions offset-only: %v", err)
+	}
+	if len(rest) != 2 || rest[0].Body != "version 1" {
+		t.Fatalf("offset without limit did not skip: got %d rows starting %q", len(rest), rest[0].Body)
+	}
+}
+
+// The default has to stay "every revision". This call could not be paged until
+// 2026-08-21, so every caller written before then passes nothing and must keep
+// getting the whole history — including the one that matters most, the claim in
+// the workspace contract that rewriting a workspace is safe because the prior
+// versions can be read back.
+func TestNoLimitStillMeansTheWholeHistory(t *testing.T) {
+	s := newTestStore(t)
+	item := mustCreateTyped(t, s, model.TypeWorkspace, "harness-watch memory", "version 0")
+	for i := 1; i <= 5; i++ {
+		body := fmt.Sprintf("version %d", i)
+		if _, err := s.UpdateItem(item.ID, &model.UpdateItemRequest{Body: &body}); err != nil {
+			t.Fatalf("UpdateItem %d: %v", i, err)
+		}
+	}
+
+	all, err := s.ListRevisions(item.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("ListRevisions: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("unpaged read returned %d revisions, want all 5", len(all))
 	}
 }

@@ -3,6 +3,8 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -221,5 +223,103 @@ func TestPostingAnUnknownParentIDIsABadRequest(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), missing) {
 		t.Errorf("the error does not name the id that was wrong: %s", w.Body.String())
+	}
+}
+
+// createAndRewrite makes an item and rewrites its body n times, leaving n
+// revisions behind. It is the fixture for the paging tests below: they need a
+// history longer than one page, and a one-revision history cannot tell a limit
+// that works from a limit that is ignored.
+func createAndRewrite(t *testing.T, h http.Handler, n int) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]interface{}{
+		"type": "workspace", "title": "harness-watch memory", "body": "version 0",
+	})
+	req := httptest.NewRequest("POST", "/api/items", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	var item model.Item
+	json.NewDecoder(w.Body).Decode(&item)
+
+	for i := 1; i <= n; i++ {
+		body, _ = json.Marshal(map[string]string{"body": fmt.Sprintf("version %d", i)})
+		req = httptest.NewRequest("PATCH", "/api/items/"+item.ID, bytes.NewReader(body))
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("update %d: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	return item.ID
+}
+
+func TestRevisionsEndpointServesAPage(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+	id := createAndRewrite(t, h, 5)
+
+	req := httptest.NewRequest("GET", "/api/items/"+id+"/revisions?limit=2", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("revisions: %d %s", w.Code, w.Body.String())
+	}
+	var page []model.Revision
+	json.NewDecoder(w.Body).Decode(&page)
+	if len(page) != 2 {
+		t.Fatalf("?limit=2 returned %d revisions", len(page))
+	}
+
+	req = httptest.NewRequest("GET", "/api/items/"+id+"/revisions?limit=2&offset=2", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var second []model.Revision
+	json.NewDecoder(w.Body).Decode(&second)
+	if len(second) != 2 {
+		t.Fatalf("second page returned %d revisions", len(second))
+	}
+	if second[0].ID == page[0].ID {
+		t.Fatalf("offset did not move the window: both pages start at revision %d", page[0].ID)
+	}
+}
+
+func TestRevisionsEndpointStillDefaultsToTheWholeHistory(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+	id := createAndRewrite(t, h, 5)
+
+	req := httptest.NewRequest("GET", "/api/items/"+id+"/revisions", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var all []model.Revision
+	json.NewDecoder(w.Body).Decode(&all)
+	if len(all) != 5 {
+		t.Fatalf("unpaged request returned %d revisions, want all 5", len(all))
+	}
+}
+
+// A limit that cannot be parsed must be refused, not swallowed. Swallowing it
+// yields 0, and 0 on this endpoint means the whole history — so ?limit=abc
+// would answer with the single most expensive response this service can produce
+// while the caller believes it asked for a small one, and nothing in the reply
+// would say otherwise.
+func TestAnUnusableLimitIsRefusedRatherThanTreatedAsUnlimited(t *testing.T) {
+	a, cleanup := setup(t)
+	defer cleanup()
+	h := a.Handler()
+	id := createAndRewrite(t, h, 5)
+
+	for _, q := range []string{"?limit=abc", "?limit=-1", "?offset=abc", "?offset=-1", "?limit=2&offset=oops"} {
+		req := httptest.NewRequest("GET", "/api/items/"+id+"/revisions"+q, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 400 {
+			t.Fatalf("GET /revisions%s = %d, want 400 (body %s)", q, w.Code, strings.TrimSpace(w.Body.String()))
+		}
 	}
 }

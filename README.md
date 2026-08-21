@@ -73,11 +73,20 @@ All bodies are JSON. `OPTIONS` on any path returns `204`.
 | `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below |
 | `DELETE` | `/api/items/{id}` | Reversible; `?hard=true` purges |
 | `POST` | `/api/items/{id}/restore` | Undo a delete |
-| `GET` | `/api/items/{id}/revisions` | Every prior state, newest first |
+| `GET` | `/api/items/{id}/revisions` | Every prior state, newest first; `?limit=&offset=` to page |
 | `POST` | `/api/items/{id}/hold` | Optional `{"reason":…}` |
 | `POST` | `/api/items/{id}/unhold` | |
 | `GET` | `/api/items/{id}/occurrences` | `?from=&to=` RFC3339; `400` if the item has no schedule |
 | `POST` | `/api/items/rerank` | `{"items":[{"id":…,"rank":…}]}` |
+
+**Paging the revision history.** A revision carries the whole body it replaced,
+so an item that is rewritten often costs the sum of every version of itself to
+read back. Measured 2026-08-21 on this box: one item with 308 revisions answered
+`GET /revisions` with **246 MB**. `?limit=` and `?offset=` walk it a page at a
+time, newest first. The default is still every revision, so nothing written
+before paging existed changes. A `limit` or `offset` that is not a non-negative
+integer is a `400` rather than a silent 0 — 0 here means unlimited, which is the
+opposite of what a caller passing `?limit=abc` was asking for.
 
 **List filters** on `GET /api/items`: `type`, `tag`, `exclude_tag` (repeatable),
 `status`, `list_id`, `created_by`, `parent_id`, `include_deleted`,

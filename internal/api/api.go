@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,6 +54,26 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// positiveIntParam reads an optional non-negative integer query parameter.
+// Absent means 0, which every caller of this reads as "unset". Anything that is
+// present but not a non-negative integer is the caller's mistake and is returned
+// as an error rather than quietly becoming 0 — the two mean opposite things on a
+// limit, and the quiet one is unbounded.
+func positiveIntParam(r *http.Request, name string) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", name, raw)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must not be negative, got %d", name, v)
+	}
+	return v, nil
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -193,7 +214,23 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action string) {
 	switch {
 	case action == "revisions" && r.Method == "GET":
-		revisions, err := a.store.ListRevisions(id)
+		// Unparseable and negative values are refused rather than defaulted.
+		// Every revision carries the whole body it replaced, so "no limit" here
+		// is the most expensive answer this service gives — 246 MB for the
+		// nightly signpost todo, measured — and it is the one a silently
+		// swallowed ?limit=abc would hand back. A caller that asked for a page
+		// and got the entire history instead has no way to tell.
+		limit, err := positiveIntParam(r, "limit")
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		offset, err := positiveIntParam(r, "offset")
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		revisions, err := a.store.ListRevisions(id, limit, offset)
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
