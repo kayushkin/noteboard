@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kayushkin/noteboard/internal/boundedtext"
 	"github.com/teambition/rrule-go"
 )
 
@@ -156,7 +157,7 @@ func (s *Schedule) Validate() error {
 			return fmt.Errorf("schedule.tzid is required when a recurrence rule is set (e.g. \"America/Los_Angeles\") — an offset is not a zone and cannot survive a DST transition")
 		}
 		if _, err := time.LoadLocation(s.TZID); err != nil {
-			return fmt.Errorf("schedule.tzid %q is not a known IANA zone: %w", s.TZID, err)
+			return fmt.Errorf("schedule.tzid %q is not a known IANA zone: %w", boundedtext.Value(s.TZID), err)
 		}
 	}
 
@@ -178,20 +179,20 @@ func (s *Schedule) Validate() error {
 	switch s.Mode {
 	case "", ScheduleModeInstance, ScheduleModeRolling:
 	default:
-		return fmt.Errorf("schedule.mode must be %q or %q, got %q", ScheduleModeInstance, ScheduleModeRolling, s.Mode)
+		return fmt.Errorf("schedule.mode must be %q or %q, got %q", ScheduleModeInstance, ScheduleModeRolling, boundedtext.Value(s.Mode))
 	}
 
 	if s.Remind != nil {
 		for _, lead := range s.Remind.Lead {
 			if _, err := ParseISO8601Duration(lead); err != nil {
-				return fmt.Errorf("schedule.remind.lead %q: %w", lead, err)
+				return fmt.Errorf("schedule.remind.lead %q: %s", boundedtext.Value(lead), boundedtext.ErrorMessage(err))
 			}
 		}
 		for _, c := range s.Remind.Channels {
 			switch c {
 			case ChannelDigest, ChannelCalendar, ChannelHerald:
 			default:
-				return fmt.Errorf("schedule.remind.channels contains unknown channel %q (want %q, %q, or %q)", c, ChannelDigest, ChannelCalendar, ChannelHerald)
+				return fmt.Errorf("schedule.remind.channels contains unknown channel %q (want %q, %q, or %q)", boundedtext.Value(c), ChannelDigest, ChannelCalendar, ChannelHerald)
 			}
 		}
 	}
@@ -405,7 +406,7 @@ func ParseISO8601Duration(s string) (ISO8601Duration, error) {
 			}
 			n, err := strconv.Atoi(digits)
 			if err != nil {
-				return fmt.Errorf("value %q: %w", digits, err)
+				return fmt.Errorf("value %q: %s", boundedtext.Value(digits), boundedtext.ErrorMessage(err))
 			}
 			*field = n
 			digits = ""

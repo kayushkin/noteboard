@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kayushkin/noteboard/internal/boundedtext"
 	"github.com/kayushkin/noteboard/internal/db"
 	"github.com/kayushkin/noteboard/model"
 )
@@ -266,7 +267,7 @@ func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action stri
 	case action == "occurrences" && r.Method == "GET":
 		a.occurrences(w, r, id)
 	default:
-		writeError(w, 404, "no such item action: "+action)
+		writeError(w, 404, "no such item action: "+boundedtext.Value(action))
 	}
 }
 
@@ -297,7 +298,7 @@ func (a *API) occurrences(w http.ResponseWriter, r *http.Request, id string) {
 	if v := q.Get("from"); v != "" {
 		from, err = time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, 400, "from must be RFC3339: "+err.Error())
+			writeError(w, 400, "from must be RFC3339: "+boundedtext.ErrorMessage(err))
 			return
 		}
 	}
@@ -305,7 +306,7 @@ func (a *API) occurrences(w http.ResponseWriter, r *http.Request, id string) {
 	if v := q.Get("to"); v != "" {
 		to, err = time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, 400, "to must be RFC3339: "+err.Error())
+			writeError(w, 400, "to must be RFC3339: "+boundedtext.ErrorMessage(err))
 			return
 		}
 	}
