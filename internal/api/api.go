@@ -143,6 +143,37 @@ func (a *API) items(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// itemChangedResponse is the body of a 412 on PATCH /api/items/{id}.
+type itemChangedResponse struct {
+	Error   string      `json:"error"`
+	Current *model.Item `json:"current"`
+}
+
+// itemVersionTag is an item's version as an ETag: its updated_at, exactly as
+// the item's JSON carries it, in quotes. A caller that has the item already
+// has the version and need not have kept the header.
+func itemVersionTag(item *model.Item) string {
+	return `"` + item.UpdatedAt.Format(time.RFC3339Nano) + `"`
+}
+
+// expectedUpdatedAtFromIfMatch reads the version a PATCH was made against. An
+// absent header, or "*", asks for no check. Anything else must be one
+// updated_at, quoted or bare; a value that cannot be read is refused rather
+// than ignored, because ignoring it would apply an update its sender believed
+// was conditional.
+func expectedUpdatedAtFromIfMatch(header string) (*time.Time, error) {
+	value := strings.TrimSpace(header)
+	if value == "" || value == "*" {
+		return nil, nil
+	}
+	value = strings.Trim(value, `"`)
+	expected, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return nil, fmt.Errorf("If-Match must be the item's updated_at exactly as the item carries it (for example \"2026-09-18T18:59:29.430695045Z\"), got %q", header)
+	}
+	return &expected, nil
+}
+
 func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/items/")
 	if id == "" {
@@ -171,6 +202,7 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 404, "not found")
 			return
 		}
+		w.Header().Set("ETag", itemVersionTag(item))
 		writeJSON(w, 200, item)
 	case "PATCH":
 		var req model.UpdateItemRequest
@@ -182,7 +214,21 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, err.Error())
 			return
 		}
+		expectedUpdatedAt, err := expectedUpdatedAtFromIfMatch(r.Header.Get("If-Match"))
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		req.ExpectedUpdatedAt = expectedUpdatedAt
 		item, err := a.store.UpdateItem(id, &req)
+		var changed *db.ItemChangedError
+		if errors.As(err, &changed) {
+			// 412 carries the item as it is now, so the caller can show what
+			// the other writer did instead of fetching it again.
+			w.Header().Set("ETag", itemVersionTag(changed.Current))
+			writeJSON(w, http.StatusPreconditionFailed, itemChangedResponse{Error: changed.Error(), Current: changed.Current})
+			return
+		}
 		if err != nil {
 			// A rejected schedule is a bad request, not a missing item. Collapsing
 			// every store error to 404 would report "not found" for an item that is
@@ -195,6 +241,7 @@ func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, err.Error())
 			return
 		}
+		w.Header().Set("ETag", itemVersionTag(item))
 		writeJSON(w, 200, item)
 	case "DELETE":
 		// Default is reversible: deleted_at is stamped and the row stays.

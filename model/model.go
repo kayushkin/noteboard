@@ -184,6 +184,12 @@ type UpdateItemRequest struct {
 	HasDueAt         bool `json:"-"`
 	HasSchedule      bool `json:"-"`
 	HasAutoHoldAtUSD bool `json:"-"`
+
+	// ExpectedUpdatedAt makes the update conditional: it is applied only if the
+	// stored item's updated_at is exactly this, and refused otherwise. It comes
+	// from the If-Match header, never from the body. Nil applies the update
+	// whatever the item's version, as every update did before this existed.
+	ExpectedUpdatedAt *time.Time `json:"-"`
 }
 
 func (r *UpdateItemRequest) UnmarshalJSON(data []byte) error {

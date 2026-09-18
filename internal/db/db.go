@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,6 +100,12 @@ func switchJournalMode(db *sql.DB) error {
 
 type Store struct {
 	db *sql.DB
+	// itemUpdateMutex makes UpdateItem's read, precondition check and write one
+	// step against every other UpdateItem. The store is one process on one
+	// connection, but a connection serialises statements, not the sequence of
+	// them: without this, two updates that both expected the same updated_at
+	// could both pass the check and the second would overwrite the first.
+	itemUpdateMutex sync.Mutex
 }
 
 func New(dbPath string) (*Store, error) {
@@ -266,6 +273,19 @@ func (s *Store) Close() error { return s.db.Close() }
 // collapse every error to 404 — the second reports "not found" for an item that
 // is plainly there, which is the same hole ErrUnknownParent was added to close.
 var ErrItemNotFound = fmt.Errorf("no such item")
+
+// ItemChangedError refuses an update whose caller expected an older version of
+// the item than the one stored: someone else wrote in between, and applying
+// the update would overwrite their change unseen. Current is the item as it is
+// now, so the caller can show what changed and decide again.
+type ItemChangedError struct {
+	Current *model.Item
+}
+
+func (e *ItemChangedError) Error() string {
+	return fmt.Sprintf("item %s was changed at %s, after the version this update was made against; nothing was written",
+		e.Current.ID, e.Current.UpdatedAt.Format(time.RFC3339Nano))
+}
 
 func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 	var item model.Item
@@ -664,9 +684,16 @@ func (s *Store) ListRevisions(itemID string, limit, offset int) ([]*model.Revisi
 }
 
 func (s *Store) UpdateItem(id string, req *model.UpdateItemRequest) (*model.Item, error) {
+	s.itemUpdateMutex.Lock()
+	defer s.itemUpdateMutex.Unlock()
+
 	existing, err := s.GetItem(id)
 	if err != nil {
 		return nil, err
+	}
+	// Checked before the snapshot, so a refused update leaves no revision.
+	if req.ExpectedUpdatedAt != nil && !existing.UpdatedAt.Equal(*req.ExpectedUpdatedAt) {
+		return nil, &ItemChangedError{Current: existing}
 	}
 	if err := s.snapshot(existing, "update"); err != nil {
 		return nil, fmt.Errorf("snapshot before update: %w", err)

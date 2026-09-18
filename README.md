@@ -70,7 +70,7 @@ All bodies are JSON. `OPTIONS` on any path returns `204`.
 | `GET` | `/api/items` | See filters below |
 | `POST` | `/api/items` | `type` and `title` required → `201` |
 | `GET` | `/api/items/{id}` | `?include_deleted=true` to fetch a tombstone |
-| `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below |
+| `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below. Conditional with `If-Match` — see [Saving over someone else's change](#saving-over-someone-elses-change) |
 | `DELETE` | `/api/items/{id}` | Reversible; `?hard=true` purges |
 | `POST` | `/api/items/{id}/restore` | Undo a delete |
 | `GET` | `/api/items/{id}/revisions` | Every prior state, newest first; `?limit=&offset=` to page |
@@ -150,6 +150,37 @@ item.
 **`workspace` is its own type**, not a tagged note: an agent's durable working
 memory, rewritten every run. It is a type so it can never be mistaken for work
 to do, and so the schema can enforce one per job.
+
+### Saving over someone else's change
+
+Two people open the same item; the first saves; the second's save was made
+against a version that is gone. Applied, it overwrites the first one's change
+and neither of them sees it happen. A `PATCH` can refuse that:
+
+```bash
+# The version is the item's updated_at, exactly as the item carries it.
+# GET also sends it as the ETag.
+curl -s -X PATCH http://localhost:8191/api/items/<id> \
+  -H 'If-Match: "2026-09-18T18:59:29.430695045Z"' \
+  -H 'Content-Type: application/json' -d '{"title":"…"}'
+```
+
+- The stored `updated_at` is exactly that → the update is applied, **200**, and
+  the answer's `ETag` is the new version.
+- It is anything else → **412** `{"error":…,"current":{…the item as it is now…}}`.
+  Nothing is written and no revision is taken. Show the difference, then retry
+  against `current.updated_at`.
+- No `If-Match`, or `If-Match: *` → applied whatever the version, as every
+  `PATCH` was before this existed. The check is the caller's to ask for.
+- An `If-Match` that is not one `updated_at` → **400**. It is not ignored: its
+  sender believes the update is conditional.
+
+The check and the write are one step against every other `PATCH`
+(`Store.itemUpdateMutex`); without that, of sixteen saves made at once against
+one version, as many as fourteen were applied
+(`TestOnlyOneOfManyConcurrentSavesAgainstOneVersionWins`). Hold, unhold, delete,
+restore and rerank also move `updated_at`, so a save made before one of those is
+refused too — the item did change. They take no precondition themselves.
 
 ### Recurrence
 
