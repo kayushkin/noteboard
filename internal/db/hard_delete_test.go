@@ -70,7 +70,7 @@ func TestAHardDeleteDestroysTheRowAndLeavesThePurgeSnapshotBehind(t *testing.T) 
 		t.Errorf("hard delete left %d row(s) in items; it must destroy the row, not tombstone it", rows)
 	}
 
-	revisions, err := s.ListRevisions(item.ID)
+	revisions, err := s.ListRevisions(item.ID, 0, 0)
 	if err != nil {
 		t.Fatalf("ListRevisions: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestTheTwoDeletesAreDistinguishableInTheRevisionLog(t *testing.T) {
 		{"soft delete", soft.ID, "delete"},
 		{"hard delete", hard.ID, "purge"},
 	} {
-		revisions, err := s.ListRevisions(tc.id)
+		revisions, err := s.ListRevisions(tc.id, 0, 0)
 		if err != nil {
 			t.Fatalf("%s: ListRevisions: %v", tc.name, err)
 		}
