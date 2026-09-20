@@ -26,6 +26,8 @@ func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.health)
 	mux.HandleFunc("/api/items/rerank", a.rerank)
+	mux.HandleFunc("/api/items/query", a.queryItems)
+	mux.HandleFunc("/api/items/query-options", a.itemsQueryOptions)
 	mux.HandleFunc("/api/items/", a.itemByID)
 	mux.HandleFunc("/api/items", a.items)
 	mux.HandleFunc("/api/lists", a.lists)
@@ -172,6 +174,45 @@ func expectedUpdatedAtFromIfMatch(header string) (*time.Time, error) {
 		return nil, fmt.Errorf("If-Match must be the item's updated_at exactly as the item carries it (for example \"2026-09-18T18:59:29.430695045Z\"), got %q", header)
 	}
 	return &expected, nil
+}
+
+// itemsQueryOptions serves what a caller of POST /api/items/query must not
+// hardcode.
+func (a *API) itemsQueryOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	writeJSON(w, 200, model.ItemsQueryOptions{Sorts: model.ItemsQuerySorts, MaxIDs: model.MaxItemsQueryIDs, MaxLimit: model.MaxItemsQueryLimit})
+}
+
+// queryItems is POST /api/items/query: of these ids, which match, in what
+// order. It is a POST because the ids are the question and a board's worth of
+// them does not fit in a URL. It changes nothing.
+func (a *API) queryItems(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	var query model.ItemsQuery
+	decoder := json.NewDecoder(r.Body)
+	// A misspelled filter that was dropped would answer every item, which reads
+	// as "all of these match".
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&query); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if err := query.Validate(); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	result, err := a.store.QueryItems(&query)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
 }
 
 func (a *API) itemByID(w http.ResponseWriter, r *http.Request) {

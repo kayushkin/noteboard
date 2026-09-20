@@ -70,6 +70,8 @@ All bodies are JSON. `OPTIONS` on any path returns `204`.
 | `GET` | `/api/items` | See filters below |
 | `POST` | `/api/items` | `type` and `title` required → `201` |
 | `GET` | `/api/items/{id}` | `?include_deleted=true` to fetch a tombstone |
+| `POST` | `/api/items/query` | Of these ids, which match a filter, in what order — see [Of these items, which match](#of-these-items-which-match). Changes nothing |
+| `GET` | `/api/items/query-options` | The sorts and limits that route takes |
 | `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below. Conditional with `If-Match` — see [Saving over someone else's change](#saving-over-someone-elses-change) |
 | `DELETE` | `/api/items/{id}` | Reversible; `?hard=true` purges |
 | `POST` | `/api/items/{id}/restore` | Undo a delete |
@@ -150,6 +152,48 @@ item.
 **`workspace` is its own type**, not a tagged note: an agent's durable working
 memory, rewritten every run. It is a type so it can never be mistaken for work
 to do, and so the schema can enforce one per job.
+
+### Of these items, which match
+
+```bash
+curl -s -X POST localhost:8191/api/items/query -H 'Content-Type: application/json' -d '{
+  "ids":["<id>","<id>","…"], "tags":["billing"], "priorities":[3],
+  "sort":"priority", "limit":25, "offset":0, "include_items":true}'
+# → {"total":310,"ids":[…the page, in order…],"items":[…],"missing_ids":[…]}
+```
+
+For a caller that owns a set of item ids and none of what the items say.
+kanban-store knows which cards sit in a column and nothing of their tags or
+priority; filtering or sorting that column used to mean reading every card to
+look. It is a `POST` because the ids are the question and a board's worth does
+not fit in a URL. It changes nothing.
+
+- An item must match **every** filter set: `tags` (all of them, exactly),
+  `priorities` (any), `statuses` (any), `due_before`.
+- `sort` is one of `GET /api/items/query-options` — `given` (the default: the
+  order the ids were sent in), `priority`, `due_at`, `updated_at`, `created_at`,
+  `title`. **Ties fall back to the order sent**, so a page is the same page
+  every time and the caller's own order survives inside a tie.
+- `limit` and `offset` cut the page **after** the filter and the sort; `total`
+  counts the matches. `include_items` answers the page as items too.
+- `missing_ids` are the ids sent that name no live item, **whatever the
+  filter**: "did not match" and "is gone" are different answers.
+- **Held items are answered.** The caller named the ids, exactly as it would to
+  `GET` each one; the hold gate is for discovery, which this is not.
+- An unknown field, sort, or an empty tag is a **400**: a filter that was
+  dropped would answer every item, which reads as "all of these match".
+
+⚠️ **Due dates are compared as instants.** `due_at` is stored as RFC 3339 with
+whatever offset its writer sent — on this host some rows end in `Z` and some in
+`-07:00`. As text, `10:00-07:00` sorts before `12:00Z` though it is five hours
+later, so the sort and `due_before` go through `julianday()`.
+
+⚠️ **The join is a `CROSS JOIN` on purpose.** Written as a plain `JOIN`, SQLite
+made `items` the outer loop and re-parsed the whole JSON list of ids once per
+item: 7,830 items times a 371 KB list ran for minutes at 100% CPU. `CROSS JOIN`
+is never reordered, so the ids are walked once. Measured on a copy of this
+host's data, 2026-09-20: about 100 ms for the largest board's 9,506 ids, 3 ms
+for 50. `TestItemsQueryWalksTheIdsOnce` pins the plan, not a time.
 
 ### Saving over someone else's change
 
