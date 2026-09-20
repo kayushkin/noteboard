@@ -9,17 +9,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kayushkin/llm-bridge/servicesettings"
 	"github.com/kayushkin/noteboard/internal/boundedtext"
 	"github.com/kayushkin/noteboard/internal/db"
 	"github.com/kayushkin/noteboard/model"
 )
 
 type API struct {
-	store *db.Store
+	store    *db.Store
+	settings *servicesettings.Registry
 }
 
-func New(store *db.Store) *API {
-	return &API{store: store}
+// New builds the API over store. settings is what GET /settings describes; a
+// nil one panics here, at boot, rather than at the first read of the route.
+func New(store *db.Store, settings *servicesettings.Registry) *API {
+	if settings == nil {
+		panic("noteboard: api.New needs the settings registry that GET /settings serves")
+	}
+	return &API{store: store, settings: settings}
 }
 
 func (a *API) Handler() http.Handler {
@@ -33,6 +40,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/api/lists", a.lists)
 	mux.HandleFunc("/api/tags", a.tags)
 	mux.HandleFunc("/api/search", a.search)
+	// Read-only, and as open as every other route. PUT /settings/{key} is not
+	// mounted: no setting is Editable, so there is nothing a write could change.
+	mux.Handle("GET /settings", servicesettings.Handler(a.settings, "/settings"))
 	return cors(mux)
 }
 

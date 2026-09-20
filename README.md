@@ -31,6 +31,11 @@ make build
 | `NOTEBOARD_PORT` | `8191` | Port to listen on |
 | `NOTEBOARD_DB` | `$HOME/.noteboard/noteboard.db` | SQLite file; schema and migrations run on open |
 
+Both are declared in `internal/settings` (llm-bridge `servicesettings`) and described, with the
+value in force, at `GET /settings`. A misspelling of either name (`NOTEBOARD_DB_PATH`), or a port
+that is not a number, stops the service at startup. `NOTEBOARD_URL` is how other programs find
+noteboard; noteboard does not read it and does not mind it being set.
+
 `deploy/noteboard.service` is a `--user` unit. `deploy.sh` reads the binary path,
 port and database path back *out of* that unit rather than restating them, then
 builds, tests, smokes on a throwaway database, installs, restarts and verifies.
@@ -107,6 +112,7 @@ leaving it out means "don't touch". Absent and null are different requests.
 | `GET` | `/api/tags` | Every unique tag with its count, most-used first |
 | `GET` | `/api/search?q=` | FTS5 over title and body; `&type=`, `&tag=`, `&status=`, `&limit=` (default 50), `&include_held=` |
 | `GET` | `/health` | `{"status":"ok","items":N}`; **500** if the database cannot be read |
+| `GET` | `/settings` | Every environment variable the service reads, with the value in force and its source; read-only |
 
 A **list is not a stored row.** `GET /api/lists` derives the set by grouping
 items on `list_id`, so a list exists exactly when an item claims it. There is no

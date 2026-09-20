@@ -97,6 +97,19 @@ step "boot-and-answer smoke on a throwaway DB, before touching the live one"
 ./scripts/e2e-smoke.sh >/dev/null || fail "e2e smoke failed — not installing. Run ./scripts/e2e-smoke.sh to see why."
 echo "    smoke passed"
 
+step "check the running service's environment against the declared settings"
+# A misspelled NOTEBOARD_PORT or NOTEBOARD_DB, or a port that is not a number,
+# stops the new binary at boot. Ask before the old one is replaced: build the
+# registry from the running service's own environment. The test prints a
+# verdict, never a value.
+live_pid="$(systemctl --user show -p MainPID --value "$UNIT_NAME")"
+if [ -n "$live_pid" ] && [ "$live_pid" != "0" ]; then
+  go test -count=1 -run '^TestTheLiveProcessEnvironmentBuildsARegistry$' ./internal/settings -args -live-environment-file="/proc/$live_pid/environ" \
+    || fail "the running service's environment would stop the new binary at boot — not installing"
+else
+  echo "    $UNIT_NAME is not running, so there is no environment to check"
+fi
+
 step "install"
 mkdir -p "$BACKUP_DIR" "$(dirname "$BIN_PATH")" "$UNIT_DIR"
 if [ -f "$BIN_PATH" ]; then

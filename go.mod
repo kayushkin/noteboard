@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/kayushkin/llm-bridge v0.0.0
 	github.com/teambition/rrule-go v1.8.2
 	modernc.org/sqlite v1.50.0
 )
@@ -18,3 +19,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/kayushkin/llm-bridge => ../llm-bridge

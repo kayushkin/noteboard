@@ -12,8 +12,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kayushkin/llm-bridge/msg"
+	"github.com/kayushkin/llm-bridge/servicesettings"
 	"github.com/kayushkin/noteboard/internal/api"
 	"github.com/kayushkin/noteboard/internal/db"
+	"github.com/kayushkin/noteboard/internal/settings"
 	"github.com/kayushkin/noteboard/model"
 	_ "modernc.org/sqlite"
 )
@@ -36,8 +39,53 @@ func setupWithPath(t *testing.T) (*api.API, string, func()) {
 		t.Fatal(err)
 	}
 	_ = os.MkdirAll(dir, 0755)
-	a := api.New(store)
+	registry, err := settings.NewRegistry(servicesettings.MapEnvironment(map[string]string{"NOTEBOARD_PORT": "18191", "NOTEBOARD_DB": path}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := api.New(store, registry)
 	return a, path, func() { store.Close() }
+}
+
+func TestGetSettingsDescribesTheServiceAndNothingCanBeWritten(t *testing.T) {
+	a, path, cleanup := setupWithPath(t)
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /settings = %d: %s", w.Code, w.Body)
+	}
+	var described msg.ServiceSettings
+	if err := json.Unmarshal(w.Body.Bytes(), &described); err != nil {
+		t.Fatal(err)
+	}
+	if described.Service != settings.ServiceName || len(described.Settings) != len(settings.Definitions()) {
+		t.Fatalf("service=%q with %d settings, want %q with %d", described.Service, len(described.Settings), settings.ServiceName, len(settings.Definitions()))
+	}
+	for _, setting := range described.Settings {
+		if setting.Editable {
+			t.Errorf("%s is editable, and this service has no operator gate to put a write behind", setting.Key)
+		}
+		if setting.Key == settings.DatabasePath && (setting.Value != path || setting.Source != msg.ServiceSettingSourceEnvironment) {
+			t.Errorf("database path served as %q from %q, want %q from the environment", setting.Value, setting.Source, path)
+		}
+	}
+
+	w = httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings/"+settings.ListenPort, strings.NewReader(`{"value":"1"}`)))
+	if w.Code == http.StatusOK {
+		t.Errorf("PUT /settings/%s = 200: a write route is mounted", settings.ListenPort)
+	}
+}
+
+func TestNewRefusesAMissingSettingsRegistry(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("api.New(store, nil) did not panic: GET /settings would fail at its first read instead of at boot")
+		}
+	}()
+	api.New(nil, nil)
 }
 
 func TestHealthEndpoint(t *testing.T) {
