@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -98,8 +99,18 @@ func switchJournalMode(db *sql.DB) error {
 	return fmt.Errorf("journal mode settled on %q, want %s", settled, journalMode)
 }
 
+// readOnlyConnectionCount is how many connections the read-only pool may hold
+// open at once. WAL lets each of them read while the single writer writes, so
+// a large list read no longer queues every other request behind it.
+const readOnlyConnectionCount = 4
+
 type Store struct {
 	db *sql.DB
+	// readOnlyDB is a second pool on the same file that only reads. The list,
+	// search and query reads run here, so a caller paging the whole table does
+	// not hold the one connection every write and single-item read needs.
+	// query_only makes SQLite refuse a write sent here by mistake.
+	readOnlyDB *sql.DB
 	// itemUpdateMutex makes UpdateItem's read, precondition check and write one
 	// step against every other UpdateItem. The store is one process on one
 	// connection, but a connection serialises statements, not the sequence of
@@ -134,7 +145,19 @@ func New(dbPath string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	readOnlyDB, err := sql.Open("sqlite", dbPath+"?"+dsnParams+"&_pragma=query_only(1)")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	readOnlyDB.SetMaxOpenConns(readOnlyConnectionCount)
+	if err := readOnlyDB.Ping(); err != nil {
+		readOnlyDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("open read-only pool: %w", err)
+	}
+
+	return &Store{db: db, readOnlyDB: readOnlyDB}, nil
 }
 
 func migrate(db *sql.DB) error {
@@ -259,7 +282,9 @@ func migrate(db *sql.DB) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	return errors.Join(s.readOnlyDB.Close(), s.db.Close())
+}
 
 // ErrItemNotFound reports that an id names no row. Every read of a single item
 // goes through scanItem, so this is the one place the condition is born and the
@@ -645,7 +670,7 @@ func (s *Store) ListRevisions(itemID string, limit, offset int) ([]*model.Revisi
 		q += fmt.Sprintf(" OFFSET %d", offset)
 	}
 
-	rows, err := s.db.Query(q, itemID)
+	rows, err := s.readOnlyDB.Query(q, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +956,7 @@ func (s *Store) UnholdItem(id string) (*model.Item, error) {
 // see it to keep generating occurrences. Deciding what a status means is the
 // coordinator's job, not the store's.
 func (s *Store) ListScheduledItems() ([]*model.Item, error) {
-	rows, err := s.db.Query(
+	rows, err := s.readOnlyDB.Query(
 		"SELECT " + itemCols + " FROM items WHERE schedule IS NOT NULL AND " + notDeleted + " ORDER BY created_at",
 	)
 	if err != nil {
@@ -1049,7 +1074,7 @@ func (s *Store) ListItems(p ListParams) ([]*model.Item, error) {
 		q += fmt.Sprintf(" OFFSET %d", p.Offset)
 	}
 
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.readOnlyDB.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +1118,7 @@ func (s *Store) Rerank(items []model.RerankItem) error {
 }
 
 func (s *Store) ListLists() ([]model.ListInfo, error) {
-	rows, err := s.db.Query("SELECT list_id, COUNT(*) as count FROM items WHERE list_id != '' AND status != 'archived' AND deleted_at IS NULL GROUP BY list_id ORDER BY list_id")
+	rows, err := s.readOnlyDB.Query("SELECT list_id, COUNT(*) as count FROM items WHERE list_id != '' AND status != 'archived' AND deleted_at IS NULL GROUP BY list_id ORDER BY list_id")
 	if err != nil {
 		return nil, err
 	}
@@ -1114,7 +1139,7 @@ func (s *Store) ListLists() ([]model.ListInfo, error) {
 }
 
 func (s *Store) ListTags() ([]model.TagInfo, error) {
-	rows, err := s.db.Query("SELECT j.value as tag, COUNT(*) as count FROM items, json_each(items.tags) as j WHERE items.status != 'archived' AND items.deleted_at IS NULL GROUP BY j.value ORDER BY count DESC")
+	rows, err := s.readOnlyDB.Query("SELECT j.value as tag, COUNT(*) as count FROM items, json_each(items.tags) as j WHERE items.status != 'archived' AND items.deleted_at IS NULL GROUP BY j.value ORDER BY count DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -1203,7 +1228,7 @@ func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
 		q = heldSubtreeCTE + " " + q
 	}
 
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.readOnlyDB.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1225,6 +1250,6 @@ func (s *Store) Search(p SearchParams) ([]*model.Item, error) {
 
 func (s *Store) ItemCount() (int, error) {
 	var count int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM items WHERE status != 'archived' AND deleted_at IS NULL").Scan(&count)
+	err := s.readOnlyDB.QueryRow("SELECT COUNT(*) FROM items WHERE status != 'archived' AND deleted_at IS NULL").Scan(&count)
 	return count, err
 }

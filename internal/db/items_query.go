@@ -37,7 +37,7 @@ func (s *Store) QueryItems(query *model.ItemsQuery) (*model.ItemsQueryResult, er
 	}
 
 	// Which of the sent ids name no live item, whatever the filter says.
-	missing, err := s.db.Query(`SELECT sent.value FROM json_each(?) AS sent
+	missing, err := s.readOnlyDB.Query(`SELECT sent.value FROM json_each(?) AS sent
 		WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.id = sent.value AND items.deleted_at IS NULL)
 		ORDER BY sent.key`, string(sent))
 	if err != nil {
@@ -87,7 +87,7 @@ func (s *Store) QueryItems(query *model.ItemsQuery) (*model.ItemsQueryResult, er
 	// TestItemsQueryWalksTheIdsOnce pins the plan.
 	from := itemsQueryFrom + strings.Join(where, " AND ")
 
-	if err := s.db.QueryRow(`SELECT COUNT(*)`+from, args...).Scan(&result.Total); err != nil {
+	if err := s.readOnlyDB.QueryRow(`SELECT COUNT(*)`+from, args...).Scan(&result.Total); err != nil {
 		return nil, err
 	}
 
@@ -103,7 +103,7 @@ func (s *Store) QueryItems(query *model.ItemsQuery) (*model.ItemsQueryResult, er
 		page += ` LIMIT -1 OFFSET ?`
 		args = append(args, query.Offset)
 	}
-	rows, err := s.db.Query(page, args...)
+	rows, err := s.readOnlyDB.Query(page, args...)
 	if err != nil {
 		return nil, err
 	}
