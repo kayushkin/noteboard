@@ -2,7 +2,7 @@
 
 ## What it owns
 
-Unified notes/todos/ranking-lists service (SQLite + FTS5, REST API on :8191). Markdown bodies, JSON tags, full-text search, rerank. Canonical backend for dash `/notes` page (proxied via `/api/noteboard/*`). Systemd user unit: `noteboard.service`. DB: `~/.noteboard/noteboard.db` (SQLite + FTS5). Single source of truth — do NOT reintroduce a filesystem-based notes tree.
+Unified notes/todos/ranking-lists service (SQLite + FTS5, REST API on 127.0.0.1:8191 — `NOTEBOARD_LISTEN_HOST`, loopback by default, because no route asks for credentials). Markdown bodies, JSON tags, full-text search, rerank. Canonical backend for dash `/notes` page (proxied via `/api/noteboard/*`). Systemd user unit: `noteboard.service`. DB: `~/.noteboard/noteboard.db` (SQLite + FTS5). Single source of truth — do NOT reintroduce a filesystem-based notes tree.
 
 ## Where this prompt lives
 

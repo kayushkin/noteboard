@@ -26,13 +26,19 @@ const ServiceName = "noteboard"
 // is theirs, noteboard never reads it, and a shared environment file that
 // carries it must not stop noteboard from starting. So NOTEBOARD_DB_PATH and
 // NOTEBOARD_PORTS are refused, and NOTEBOARD_URL is not.
-var OwnedEnvironmentVariablePrefixes = []string{"NOTEBOARD_PORT", "NOTEBOARD_DB"}
+var OwnedEnvironmentVariablePrefixes = []string{"NOTEBOARD_PORT", "NOTEBOARD_LISTEN", "NOTEBOARD_DB"}
 
 // Keys of the settings, as GET /settings names them.
 const (
+	ListenHost   = "listen_host"
 	ListenPort   = "listen_port"
 	DatabasePath = "database_path"
 )
+
+// DefaultListenHost is the interface the service listens on with nothing set:
+// loopback only. No route here asks for credentials, so every interface would
+// open the notes to anyone who can reach the host; callers use localhost.
+const DefaultListenHost = "127.0.0.1"
 
 // DefaultListenPort is the port the service listens on with nothing set.
 const DefaultListenPort = "8191"
@@ -55,8 +61,10 @@ func DefaultDatabasePath() string {
 // operator gate: GET /settings is as open as every other route.
 func Definitions() []servicesettings.Definition {
 	return []servicesettings.Definition{
+		{Key: ListenHost, EnvironmentVariable: "NOTEBOARD_LISTEN_HOST", Kind: msg.ServiceSettingKindWiring, ValueType: msg.ServiceSettingValueTypeString, Default: DefaultListenHost,
+			Description: "The interface the HTTP server listens on. The default is loopback, because no route asks for credentials; an empty value or 0.0.0.0 opens every route to every interface."},
 		{Key: ListenPort, EnvironmentVariable: "NOTEBOARD_PORT", Kind: msg.ServiceSettingKindWiring, ValueType: msg.ServiceSettingValueTypeInteger, Default: DefaultListenPort,
-			Description: "The port the HTTP server listens on, on every interface. Changing it moves the service, so everything that reads NOTEBOARD_URL must be told the new address."},
+			Description: "The port the HTTP server listens on, on the interface NOTEBOARD_LISTEN_HOST names. Changing it moves the service, so everything that reads NOTEBOARD_URL must be told the new address."},
 		{Key: DatabasePath, EnvironmentVariable: "NOTEBOARD_DB", Kind: msg.ServiceSettingKindPath, ValueType: msg.ServiceSettingValueTypeString, Default: DefaultDatabasePath(), Required: true,
 			Description: "The SQLite file that holds every note, todo and list. Changing it starts the service on whatever database is there, or a new empty one; the old items stay where they were."},
 	}

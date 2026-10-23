@@ -1,9 +1,10 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/kayushkin/llm-bridge/servicesettings"
 	"github.com/kayushkin/noteboard/internal/api"
@@ -28,7 +29,7 @@ func main() {
 	defer store.Close()
 
 	a := api.New(store, registry)
-	addr := fmt.Sprintf(":%d", registry.Integer(settings.ListenPort))
+	addr := net.JoinHostPort(registry.String(settings.ListenHost), strconv.Itoa(registry.Integer(settings.ListenPort)))
 	log.Printf("noteboard listening on %s (db: %s)", addr, dbPath)
 	log.Fatal(http.ListenAndServe(addr, a.Handler()))
 }

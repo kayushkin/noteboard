@@ -148,3 +148,13 @@ func TestEveryEnvironmentVariableTheServiceReadsIsDeclared(t *testing.T) {
 		t.Fatalf("the scan read %d files; it is not looking at the service", filesRead)
 	}
 }
+
+func TestTheServiceListensOnLoopbackWithNothingSet(t *testing.T) {
+	registry, err := NewRegistry(servicesettings.MapEnvironment(map[string]string{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.String(ListenHost); got != "127.0.0.1" {
+		t.Fatalf("listen host with nothing set is %q; every route is open, so it must be loopback", got)
+	}
+}
