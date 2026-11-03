@@ -12,8 +12,9 @@ import (
 // `sent` (json_each: key is the position an id was sent at). Every order ends
 // in sent.key, which no two rows share, so a page is the same page every time.
 var itemsQueryOrder = map[model.ItemsQuerySort]string{
-	model.ItemsQuerySortGiven:     "sent.key",
-	model.ItemsQuerySortPriority:  "items.priority DESC, sent.key",
+	model.ItemsQuerySortUpdatedAsc: "items.updated_at ASC, sent.key",
+	model.ItemsQuerySortGiven:      "sent.key",
+	model.ItemsQuerySortPriority:   "items.priority DESC, sent.key",
 	// due_at is stored as RFC 3339 with whatever offset its writer sent: on
 	// this host 30 rows end in Z and 17 in -07:00 (measured 2026-09-20). As
 	// strings, 10:00-07:00 sorts before 12:00Z though it is five hours later,
@@ -77,6 +78,18 @@ func (s *Store) QueryItems(query *model.ItemsQuery) (*model.ItemsQueryResult, er
 		// Instants, not text: see itemsQueryOrder.
 		where = append(where, "items.due_at IS NOT NULL AND julianday(items.due_at) < julianday(?)")
 		args = append(args, query.DueBefore.UTC().Format(time.RFC3339))
+	}
+	if query.Q != "" {
+		where = append(where, "instr(unicode_lower(items.title || char(10) || items.body || char(10) || items.id), ?) > 0")
+		args = append(args, strings.ToLower(query.Q))
+	}
+	if query.CreatedFrom != nil {
+		where = append(where, "julianday(items.created_at) >= julianday(?)")
+		args = append(args, query.CreatedFrom.UTC().Format(time.RFC3339Nano))
+	}
+	if query.CreatedTo != nil {
+		where = append(where, "julianday(items.created_at) <= julianday(?)")
+		args = append(args, query.CreatedTo.UTC().Format(time.RFC3339Nano))
 	}
 	// CROSS JOIN, not JOIN, and it is not style. SQLite is free to reorder a
 	// JOIN and, given an index on deleted_at, it made items the outer loop —

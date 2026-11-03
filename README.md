@@ -75,6 +75,7 @@ All bodies are JSON. `OPTIONS` on any path returns `204`.
 | `GET` | `/api/items` | See filters below |
 | `POST` | `/api/items` | `type` and `title` required → `201` |
 | `GET` | `/api/items/{id}` | `?include_deleted=true` to fetch a tombstone |
+| `POST` | `/api/items/batch` | Read `{"ids":[…]}` as `{"items":[…]}` in input order; duplicates retained, null for missing/deleted, held items included, complete content |
 | `POST` | `/api/items/query` | Of these ids, which match a filter, in what order — see [Of these items, which match](#of-these-items-which-match). Changes nothing |
 | `GET` | `/api/items/query-options` | The sorts and limits that route takes |
 | `PATCH` | `/api/items/{id}` | Partial update; see nullable fields below. Conditional with `If-Match` — see [Saving over someone else's change](#saving-over-someone-elses-change) |
@@ -282,3 +283,12 @@ FTS5 compiles green and fails at `CREATE VIRTUAL TABLE`, and a Go 1.22+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Query text and creation dates
+
+`POST /api/items/query` also accepts `q` (a literal case-insensitive Unicode
+substring across title, body and id), inclusive RFC3339 `created_from` and
+`created_to`, and `sort: "updated_asc"`. Filtering occurs before paging and
+`total` counts all matches. Percent and underscore characters are literal,
+not SQL wildcards. Batch reads have no filters and preserve every requested
+slot; an unavailable store fails the batch rather than returning null records.

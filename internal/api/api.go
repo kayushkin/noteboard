@@ -34,6 +34,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/health", a.health)
 	mux.HandleFunc("/api/items/rerank", a.rerank)
 	mux.HandleFunc("/api/items/query", a.queryItems)
+	mux.HandleFunc("/api/items/batch", a.batchItems)
 	mux.HandleFunc("/api/items/query-options", a.itemsQueryOptions)
 	mux.HandleFunc("/api/items/", a.itemByID)
 	mux.HandleFunc("/api/items", a.items)

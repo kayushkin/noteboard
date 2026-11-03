@@ -23,13 +23,14 @@ const (
 	// ItemsQuerySortCreatedAt is newest first.
 	ItemsQuerySortCreatedAt ItemsQuerySort = "created_at"
 	// ItemsQuerySortTitle is by title, ignoring case.
-	ItemsQuerySortTitle ItemsQuerySort = "title"
+	ItemsQuerySortTitle      ItemsQuerySort = "title"
+	ItemsQuerySortUpdatedAsc ItemsQuerySort = "updated_asc"
 )
 
 // ItemsQuerySorts is the vocabulary, served by GET /api/items/query-options.
 var ItemsQuerySorts = []ItemsQuerySort{
 	ItemsQuerySortGiven, ItemsQuerySortPriority, ItemsQuerySortDueAt,
-	ItemsQuerySortUpdatedAt, ItemsQuerySortCreatedAt, ItemsQuerySortTitle,
+	ItemsQuerySortUpdatedAt, ItemsQuerySortCreatedAt, ItemsQuerySortTitle, ItemsQuerySortUpdatedAsc,
 }
 
 // MaxItemsQueryIDs bounds one query. The largest kanban board here held 9,503
@@ -58,6 +59,10 @@ type ItemsQueryOptions struct {
 // is for discovery, which this is not. Deleted items are not.
 type ItemsQuery struct {
 	IDs []string `json:"ids"`
+	// Q is a literal, case-insensitive substring of title, body or id.
+	Q           string     `json:"q,omitempty"`
+	CreatedFrom *time.Time `json:"created_from,omitempty"`
+	CreatedTo   *time.Time `json:"created_to,omitempty"`
 	// Tags keeps items carrying ALL of these, matched exactly.
 	Tags []string `json:"tags,omitempty"`
 	// Priorities keeps items whose priority is ANY of these.
