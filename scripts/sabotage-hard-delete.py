@@ -34,7 +34,7 @@ Case-writing rules, inherited from the fleet's other scorers:
   - Prefer a DRIFTED VALUE to a deletion. It orphans no identifier, needs no
     second edit, and is the likelier real regression. `go test` runs vet, so an
     edit that fails to compile reports a build error instead of a score, and a
-    build error hides whether any test would have caught the behaviour.
+    build error hides whether any test would have caught the behavior.
   - Two controls, not one. A scorer with only a cry-wolf control reports CAUGHT
     for everything and looks perfect; a scorer with only a known-negative
     cannot tell a working suite from a harness that never runs the tests.
@@ -89,7 +89,7 @@ CASES = [
         replace="CREATE INDEX IF NOT EXISTS idx_item_revisions_lookup ON item_revisions(item_id, id DESC);",
         expect_caught=False,
         why=(
-            "An index name is invisible to behaviour. If this reports CAUGHT the "
+            "An index name is invisible to behavior. If this reports CAUGHT the "
             "suite is failing for a reason unrelated to what it asserts, and every "
             "other CAUGHT below is suspect."
         ),
@@ -113,7 +113,7 @@ CASES = [
         why=(
             "The whole difference between the two values of `hard`. A read path "
             "that filters tombstones cannot tell this mutation from correct "
-            "behaviour, which is why the test counts the raw items table."
+            "behavior, which is why the test counts the raw items table."
         ),
     ),
     Case(

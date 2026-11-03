@@ -386,7 +386,7 @@ func (a *API) itemAction(w http.ResponseWriter, r *http.Request, id, action stri
 // A recurrence rule is uniquely bad at failing visibly — BYDAY=3TU and
 // BYDAY=TU;BYSETPOS=3 both look plausible, and a wrong one does not error, it
 // just quietly reminds you on the wrong Tuesday, which you find out about a month
-// later. This endpoint makes the rule's behaviour checkable at the moment you
+// later. This endpoint makes the rule's behavior checkable at the moment you
 // write it rather than at the moment it fails.
 //
 // Both due occurrences and nag firings are returned, because they are separately

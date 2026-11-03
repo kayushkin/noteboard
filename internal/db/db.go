@@ -19,7 +19,7 @@ import (
 // dsnParams configures every connection modernc.org/sqlite opens.
 //
 // _pragma is the ONLY way this driver accepts pragmas — it silently ignores
-// unrecognised DSN keys, so the mattn-style "_journal_mode=WAL&_busy_timeout=5000"
+// unrecognized DSN keys, so the mattn-style "_journal_mode=WAL&_busy_timeout=5000"
 // this used to carry would be accepted and do nothing at all.
 //
 // _time_format=sqlite pins how a time.Time binds to a DATETIME column. The
@@ -113,7 +113,7 @@ type Store struct {
 	readOnlyDB *sql.DB
 	// itemUpdateMutex makes UpdateItem's read, precondition check and write one
 	// step against every other UpdateItem. The store is one process on one
-	// connection, but a connection serialises statements, not the sequence of
+	// connection, but a connection serializes statements, not the sequence of
 	// them: without this, two updates that both expected the same updated_at
 	// could both pass the check and the second would overwrite the first.
 	itemUpdateMutex sync.Mutex
@@ -132,7 +132,7 @@ func New(dbPath string) (*Store, error) {
 
 	// modernc.org/sqlite still surfaces SQLITE_BUSY to concurrent writers even
 	// with WAL and a busy_timeout set, so the pool is pinned to a single
-	// connection and writes serialise in database/sql instead.
+	// connection and writes serialize in database/sql instead.
 	db.SetMaxOpenConns(1)
 
 	if err := switchJournalMode(db); err != nil {
@@ -288,7 +288,7 @@ func (s *Store) Close() error {
 
 // ErrItemNotFound reports that an id names no row. Every read of a single item
 // goes through scanItem, so this is the one place the condition is born and the
-// one error every caller has to recognise — the driver's own sql.ErrNoRows says
+// one error every caller has to recognize — the driver's own sql.ErrNoRows says
 // "a query returned nothing", which is true of a great many failures that are
 // not the caller naming a row that isn't there.
 //
@@ -378,7 +378,7 @@ func scanItem(row interface{ Scan(...any) error }) (*model.Item, error) {
 		item.Links = []string{}
 	}
 	if dueAt.Valid {
-		// Kept in whatever zone it was stored with, not normalised to UTC: the
+		// Kept in whatever zone it was stored with, not normalized to UTC: the
 		// offset is part of the value a caller gave us, and JSON renders it back.
 		t := dueAt.Time
 		item.DueAt = &t

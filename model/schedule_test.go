@@ -340,7 +340,7 @@ func TestDigestIsTheDefaultChannel(t *testing.T) {
 		t.Error("an explicit channel list must not silently also mean digest")
 	}
 	if !explicit.DeliversOn(ChannelCalendar) {
-		t.Error("explicit calendar channel not honoured")
+		t.Error("explicit calendar channel not honored")
 	}
 }
 

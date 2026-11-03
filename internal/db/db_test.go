@@ -126,7 +126,7 @@ func TestReadsRowsWrittenByTheLegacyDriver(t *testing.T) {
 
 // TestStoredTimestampsAreReadableBySQLiteDateFunctions is the sharpest reason
 // the format pin exists. A Go time.Time.String() value is not a timestamp
-// SQLite recognises, and SQLite does not complain about that — date() and
+// SQLite recognizes, and SQLite does not complain about that — date() and
 // friends just return NULL. Any date arithmetic in SQL would quietly evaluate
 // to nothing, so the loud assertion belongs here.
 func TestStoredTimestampsAreReadableBySQLiteDateFunctions(t *testing.T) {
@@ -143,7 +143,7 @@ func TestStoredTimestampsAreReadableBySQLiteDateFunctions(t *testing.T) {
 	}
 	if day == nil || julian == nil {
 		t.Fatalf("SQLite cannot parse the stored created_at: date()=%v julianday()=%v\n"+
-			"The value was written in an encoding SQLite does not recognise as a timestamp.", day, julian)
+			"The value was written in an encoding SQLite does not recognize as a timestamp.", day, julian)
 	}
 	if day != today {
 		t.Errorf("date(created_at) = %v, want %v", day, today)
@@ -884,7 +884,7 @@ func TestNoLimitStillMeansTheWholeHistory(t *testing.T) {
 
 // TestAMissingRowIsReportedAsErrItemNotFound. Every single-item read goes
 // through scanItem, so the condition is born in one place and every caller can
-// recognise it with errors.Is. Before this, the only signal was the driver's
+// recognize it with errors.Is. Before this, the only signal was the driver's
 // sql.ErrNoRows, which a handler can match on only by importing database/sql to
 // ask a question about its own store.
 func TestAMissingRowIsReportedAsErrItemNotFound(t *testing.T) {

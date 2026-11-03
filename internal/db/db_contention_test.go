@@ -20,7 +20,7 @@ import (
 // Holding a write transaction on the fresh file makes the race deterministic
 // rather than roughly-half-the-time. Against the DSN version this fails on every
 // run, and it fails instantly: the 0s is the assertion, because a store that had
-// honoured its own 5s busy_timeout would have outlasted a 150ms lock.
+// honored its own 5s busy_timeout would have outlasted a 150ms lock.
 func TestNewWaitsOutAConversionItLoses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "noteboard.db")
 
@@ -66,7 +66,7 @@ func TestNewWaitsOutAConversionItLoses(t *testing.T) {
 // settings have to actually reach SQLite, and they arrive by different routes now
 // — busy_timeout as a DSN pragma, journal_mode as a statement switchJournalMode
 // runs once. Each route fails quietly in its own way. modernc drops a DSN key it
-// does not recognise instead of rejecting it, so the mattn-style spelling this
+// does not recognize instead of rejecting it, so the mattn-style spelling this
 // store used to carry applied nothing and said nothing; and a lost journal_mode
 // race can report the mode the file stayed on rather than an error. Asserting on
 // the pragmas, not on the DSN string, is what makes this unfakeable.
